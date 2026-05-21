@@ -1,0 +1,84 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: dropship_postgres
+    environment:
+      POSTGRES_USER: dropship
+      POSTGRES_PASSWORD: dropship
+      POSTGRES_DB: dropship
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dropship -d dropship"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: dropship_redis
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dropship_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Uncomment the above deploy block only if you have an NVIDIA GPU
+    # For CPU-only, remove the deploy block entirely
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dropship_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://dropship:dropship@postgres:5432/dropship
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_BASE_URL=http://ollama:11434
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    command: >
+      sh -c "
+        alembic upgrade head 2>/dev/null || true &&
+        uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+      "
+
+volumes:
+  postgres_data:
+  redis_data:
+  ollama_data:
