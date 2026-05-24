@@ -53,6 +53,7 @@ except Exception as e:
 # ------------------------------------------------------------------
 routers = []
 
+
 ROUTERS_TO_LOAD = [
     ("app.routers.webhooks", "webhooks", False),
     ("app.routers.telegram", "telegram_router", False),
