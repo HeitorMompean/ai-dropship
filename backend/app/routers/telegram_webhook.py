@@ -1,19 +1,11 @@
-"""
-telegram_webhook.py - Fixed enum bug
-APPROVE -> executed, REJECT -> cancelled, NEGOTIATE -> replied
-"""
-
-import logging
-import json
-import traceback
+"""telegram_webhook - handles Telegram buttons"""
+import logging, json, traceback
 from datetime import datetime
 from typing import Optional
-
 from fastapi import APIRouter, Request, HTTPException, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from httpx import AsyncClient
-
 from app.database import AsyncSessionLocal
 from app.models import Decision, DecisionStatus
 from app.schemas import DecisionStatusEnum
@@ -23,288 +15,162 @@ from app.services.telegram_ai_engine import ai_engine
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/telegram", tags=["telegram_webhook"])
 
-_BOT_TOKEN: Optional[str] = None
-_CHAT_ID: Optional[str] = None
+BOT_TOKEN = getattr(settings, "telegram_bot_token", "") or ""
+CHAT_ID = getattr(settings, "telegram_chat_id", "") or ""
 
-
-def _bot_token() -> str:
-    global _BOT_TOKEN
-    if _BOT_TOKEN is None:
-        _BOT_TOKEN = getattr(settings, "telegram_bot_token", "") or ""
-    return _BOT_TOKEN
-
-
-def _chat_id() -> str:
-    global _CHAT_ID
-    if _CHAT_ID is None:
-        _CHAT_ID = getattr(settings, "telegram_chat_id", "") or ""
-    return _CHAT_ID
-
-
-async def _tg_api(method: str, payload: dict) -> dict:
-    token = _bot_token()
-    if not token:
-        return {}
-    url = f"https://api.telegram.org/bot{token}/{method}"
+async def tg_api(method: str, payload: dict) -> dict:
+    if not BOT_TOKEN: return {}
     try:
-        async with AsyncClient(timeout=30) as client:
-            r = await client.post(url, json=payload)
-            data = r.json()
-            return data.get("result", {})
-    except Exception:
-        return {}
+        async with AsyncClient(timeout=30) as c:
+            r = await c.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=payload)
+            return r.json().get("result", {})
+    except: return {}
 
+async def send_msg(chat_id: str, text: str, markup: Optional[dict] = None):
+    p = {"chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML"}
+    if markup: p["reply_markup"] = json.dumps(markup)
+    return await tg_api("sendMessage", p)
 
-async def _send_message(chat_id: str, text: str, reply_markup: Optional[dict] = None) -> dict:
-    payload = {"chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML"}
-    if reply_markup is not None:
-        payload["reply_markup"] = json.dumps(reply_markup)
-    return await _tg_api("sendMessage", payload)
+async def answer_cb(cb_id: str, text: str = ""):
+    await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": text[:200]})
 
+async def get_db():
+    async with AsyncSessionLocal() as s: yield s
 
-async def _answer_callback(callback_query_id: str, text: str = "") -> None:
-    await _tg_api("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text[:200]})
+VALID = [e.value for e in DecisionStatusEnum]
 
+async def resolve_decision(did: int, status: str, db: AsyncSession) -> Decision:
+    MAP = {"approve": "executed", "reject": "cancelled", "negotiate": "replied",
+           "executed": "executed", "cancelled": "cancelled", "pending": "pending",
+           "replied": "replied", "timeout": "timeout"}
+    r = MAP.get(status.lower(), status)
+    if r not in VALID: raise ValueError(f"Bad status '{status}' -> '{r}'. Valid: {VALID}")
+    res = await db.execute(select(Decision).where(Decision.id == did))
+    d = res.scalar_one_or_none()
+    if not d: raise ValueError(f"Decision {did} not found")
+    try: d.status = DecisionStatus(r)
+    except: d.status = r
+    d.updated_at = datetime.utcnow()
+    await db.commit(); await db.refresh(d)
+    logger.info(f"Decision {did} -> {r}")
+    return d
 
-async def _get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
-
-
-_STATUS_MAP = {
-    "approve":     DecisionStatusEnum.executed.value,
-    "reject":      DecisionStatusEnum.cancelled.value,
-    "negotiate":   DecisionStatusEnum.replied.value,
-    "executed":    DecisionStatusEnum.executed.value,
-    "cancelled":   DecisionStatusEnum.cancelled.value,
-    "pending":     DecisionStatusEnum.pending.value,
-    "replied":     DecisionStatusEnum.replied.value,
-    "timeout":     DecisionStatusEnum.timeout.value,
-}
-_VALID_STATUSES = [e.value for e in DecisionStatusEnum]
-
-
-async def _resolve_decision(decision_id: int, status_value: str, db: AsyncSession) -> Decision:
-    resolved = _STATUS_MAP.get(status_value.lower(), status_value)
-    if resolved not in _VALID_STATUSES:
-        raise ValueError(f"Invalid status '{status_value}' -> '{resolved}'. Valid: {_VALID_STATUSES}")
-
-    result = await db.execute(select(Decision).where(Decision.id == decision_id))
-    decision = result.scalar_one_or_none()
-    if decision is None:
-        raise ValueError(f"Decision {decision_id} not found")
-
-    try:
-        decision.status = DecisionStatus(resolved)
-    except (ValueError, KeyError):
-        decision.status = resolved
-
-    decision.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(decision)
-    return decision
-
-
-async def _trigger_storekeeper_and_ad(decision: Decision, db: AsyncSession) -> None:
+async def trigger_pipeline(decision: Decision, db: AsyncSession):
     ctx = decision.context_json or {}
-    title = ctx.get("product_title", "Untitled Product")
+    title = ctx.get("product_title", "Product")
     cost = float(ctx.get("cost", 0) or 0)
     sell = float(ctx.get("price", 0) or ctx.get("sell_price", 0) or 0)
     supplier = ctx.get("supplier", "") or ctx.get("supplier_url", "") or ""
-    description = ctx.get("description", "") or ctx.get("ai_description", "") or title
-    margin_pct = ((sell - cost) / cost * 100) if cost > 0 else 0
-
-    chat_id = _chat_id()
-    if not chat_id:
-        return
-
-    await _send_message(chat_id, f"<b>Auto-Pipeline Started</b>\n\n<b>{title}</b>\nCost: ${cost:.2f} -> Sell: ${sell:.2f}\nMargin: {margin_pct:.1f}%\n\n<i>Listing on Shopify...</i>")
-
-    shopify_id = None
+    desc = ctx.get("description", "") or ctx.get("ai_description", "") or title
+    margin = ((sell - cost) / cost * 100) if cost > 0 else 0
+    if not CHAT_ID: return
+    await send_msg(CHAT_ID, f"<b>Auto-Pipeline Started</b>\n\n<b>{title}</b>\nCost: ${cost:.2f} -> Sell: ${sell:.2f}\nMargin: {margin:.1f}%\n\n<i>Listing on Shopify...</i>")
+    sid = None
     try:
         from app.agents.agent_storekeeper import AgentStorekeeper
-        storekeeper = AgentStorekeeper()
-        result = await storekeeper.list_product(
-            title=title, description=description, cost_price=cost,
-            sell_price=sell, supplier_url=supplier, request_approval=False,
-        )
-        shopify_id = str(result.get("product_id", "unknown")) if isinstance(result, dict) else str(result)
-        await _send_message(chat_id, f"<b>Listed on Shopify</b>\nID: {shopify_id}")
-    except Exception as exc:
-        shopify_id = "failed"
-        await _send_message(chat_id, f"<b>Shopify listing failed</b>\n{str(exc)[:300]}")
-
-    await _send_message(chat_id, "<b>Generating Facebook ad copy...</b>")
-
-    ad_data = {
-        "headline": title[:40],
-        "primary_text": description[:125] if description else f"Get {title} now! Limited time offer.",
-        "cta": "Shop Now",
-        "targeting": "25-54, All Genders, Online Shopping",
-        "budget": "$20/day",
-    }
-
+        r = await AgentStorekeeper().list_product(title=title, description=desc, cost_price=cost, sell_price=sell, supplier_url=supplier, request_approval=False)
+        sid = str(r.get("product_id", "unknown")) if isinstance(r, dict) else str(r)
+        await send_msg(CHAT_ID, f"<b>Listed on Shopify</b>\nID: {sid}")
+    except Exception as e:
+        sid = "failed"
+        await send_msg(CHAT_ID, f"<b>Shopify failed</b>\n{str(e)[:300]}")
+    await send_msg(CHAT_ID, "<b>Generating Facebook ad copy...</b>")
+    ad = {"headline": title[:40], "primary_text": desc[:125] if desc else f"Get {title} now!", "cta": "Shop Now", "targeting": "25-54, All Genders, Online Shopping", "budget": "$20/day"}
     try:
-        ai_prompt = (
-            f"Create a Facebook ad for this dropshipping product.\n\n"
-            f"Product: {title}\nDescription: {description}\nPrice: ${sell:.2f}\nMargin: {margin_pct:.1f}%\n\n"
-            f"Respond with ONLY a JSON object containing:\n"
-            f'{{"headline": "...", "primary_text": "...", "cta": "...", "targeting": "...", "budget": "..."}}'
-        )
-        ai_result = await ai_engine.process_message(ai_prompt, chat_id=chat_id)
-        raw_msg = ai_result.get("message", "") if isinstance(ai_result, dict) else str(ai_result)
-        json_start = raw_msg.find("{")
-        json_end = raw_msg.rfind("}") + 1
-        if json_start >= 0 and json_end > json_start:
-            try:
-                parsed = json.loads(raw_msg[json_start:json_end])
-                for key in ad_data:
-                    if key in parsed and parsed[key]:
-                        ad_data[key] = str(parsed[key])
-            except json.JSONDecodeError:
-                pass
-    except Exception as exc:
-        logger.error(f"AI ad gen failed: {exc}")
+        ai_prompt = f"Create a Facebook ad for this dropshipping product.\n\nProduct: {title}\nDescription: {desc}\nPrice: ${sell:.2f}\nMargin: {margin:.1f}%\n\nRespond with ONLY a JSON object containing:\n{{'headline': '...', 'primary_text': '...', 'cta': '...', 'targeting': '...', 'budget': '...'}}"
+        result = await ai_engine.process_message(ai_prompt, chat_id=CHAT_ID)
+        msg = result.get("message", "") if isinstance(result, dict) else str(result)
+        j1, j2 = msg.find("{"), msg.rfind("}") + 1
+        if j1 >= 0 and j2 > j1:
+            parsed = json.loads(msg[j1:j2])
+            for k in ad:
+                if k in parsed and parsed[k]: ad[k] = str(parsed[k])
+    except Exception as e: logger.error(f"AI ad failed: {e}")
+    sid = sid or "unknown"
+    kb = {"inline_keyboard": [[{"text": "Launch Ad on Facebook", "callback_data": f"ad:{sid}:launch"}],
+                               [{"text": "Edit Copy", "callback_data": f"ad:{sid}:edit"}],
+                               [{"text": "Skip Ad", "callback_data": f"ad:{sid}:skip"}]]}
+    await send_msg(CHAT_ID, f"<b>Facebook Ad Ready</b>\n\n<b>{ad['headline']}</b>\n\n{ad['primary_text']}\n\nCTA: <b>{ad['cta']}</b>\nTargeting: {ad['targeting']}\nBudget: {ad['budget']}\n\nShopify ID: {sid}", markup=kb)
 
-    shopify_id = shopify_id or "unknown"
-    keyboard = {
-        "inline_keyboard": [
-            [{"text": "Launch Ad on Facebook", "callback_data": f"ad:{shopify_id}:launch"}],
-            [{"text": "Edit Copy", "callback_data": f"ad:{shopify_id}:edit"}],
-            [{"text": "Skip Ad", "callback_data": f"ad:{shopify_id}:skip"}],
-        ]
-    }
-
-    await _send_message(
-        chat_id,
-        f"<b>Facebook Ad Ready</b>\n\n<b>{ad_data['headline']}</b>\n\n{ad_data['primary_text']}\n\nCTA: <b>{ad_data['cta']}</b>\nTargeting: {ad_data['targeting']}\nBudget: {ad_data['budget']}\n\nShopify ID: {shopify_id}",
-        reply_markup=keyboard,
-    )
-
-
-async def _handle_callback(query_data: str, chat_id: str, db: AsyncSession) -> Optional[str]:
-    logger.info(f"Callback: '{query_data}'")
-    parts = query_data.split(":")
-    if len(parts) < 3:
-        return "Invalid callback data"
-
-    prefix, entity_id, action = parts[0], parts[1], parts[2]
-
+async def handle_cb(data: str, chat_id: str, db: AsyncSession) -> Optional[str]:
+    logger.info(f"CB: {data}")
+    parts = data.split(":")
+    if len(parts) < 3: return "Invalid callback"
+    prefix, eid, action = parts[0], parts[1], parts[2]
     if prefix == "decision":
-        try:
-            decision_id = int(entity_id)
-        except ValueError:
-            return f"Invalid decision ID: {entity_id}"
-
+        try: did = int(eid)
+        except: return f"Bad ID: {eid}"
         if action == "approve":
-            try:
-                decision = await _resolve_decision(decision_id, "executed", db)
-            except ValueError as exc:
-                return f"Error: {exc}"
-            ctx = decision.context_json or {}
-            title = ctx.get("product_title", "Product")
-            await _trigger_storekeeper_and_ad(decision, db)
-            return f"<b>APPROVED</b>: {title}\n\nAuto-pipeline triggered (Shopify -> Facebook Ad)!"
-
+            try: d = await resolve_decision(did, "executed", db)
+            except ValueError as e: return f"Error: {e}"
+            ctx = d.context_json or {}
+            await trigger_pipeline(d, db)
+            return f"<b>APPROVED</b>: {ctx.get('product_title', 'Product')}\n\nAuto-pipeline triggered (Shopify -> Facebook Ad)!"
         elif action == "reject":
-            try:
-                decision = await _resolve_decision(decision_id, "cancelled", db)
-            except ValueError as exc:
-                return f"Error: {exc}"
-            ctx = decision.context_json or {}
+            try: d = await resolve_decision(did, "cancelled", db)
+            except ValueError as e: return f"Error: {e}"
+            ctx = d.context_json or {}
             return f"<b>REJECTED</b>: {ctx.get('product_title', 'Product')}"
-
         elif action == "negotiate":
-            try:
-                decision = await _resolve_decision(decision_id, "replied", db)
-            except ValueError as exc:
-                return f"Error: {exc}"
-            ctx = decision.context_json or {}
+            try: d = await resolve_decision(did, "replied", db)
+            except ValueError as e: return f"Error: {e}"
+            ctx = d.context_json or {}
             cost = float(ctx.get("cost", 0) or 0)
             sell = float(ctx.get("price", 0) or ctx.get("sell_price", 0) or 0)
-            margin = ((sell - cost) / cost * 100) if cost > 0 else 0
-            return f"<b>Negotiate Mode</b>\n\n{ctx.get('product_title', 'Product')}\nCost ${cost:.2f} -> Sell ${sell:.2f}\nMargin: {margin:.1f}%\n\nReply with your target price."
-
-        elif action == "alternatives":
-            return "<b>Finding Alternatives</b>\n\nSearching AliExpress for similar products at better prices."
-
+            m = ((sell - cost) / cost * 100) if cost > 0 else 0
+            return f"<b>Negotiate Mode</b>\n\n{ctx.get('product_title', 'Product')}\nCost ${cost:.2f} -> Sell ${sell:.2f}\nMargin: {m:.1f}%\n\nReply with your target price."
+        elif action == "alternatives": return "<b>Finding Alternatives</b>\n\nSearching AliExpress for similar products."
         elif action == "analysis":
-            result = await db.execute(select(Decision).where(Decision.id == decision_id))
-            decision = result.scalar_one_or_none()
-            if not decision:
-                return f"Decision {decision_id} not found"
-            ctx = decision.context_json or {}
-            scores = ctx.get("scores", {})
-            score_lines = "\n".join(f"  {k}: {v}/100" for k, v in scores.items()) if scores else f"  Overall: {ctx.get('overall_score', 'N/A')}/100"
+            res = await db.execute(select(Decision).where(Decision.id == did))
+            d = res.scalar_one_or_none()
+            if not d: return f"Decision {did} not found"
+            ctx = d.context_json or {}
+            sc = ctx.get("scores", {})
+            sl = "\n".join(f"  {k}: {v}/100" for k, v in sc.items()) if sc else f"  Overall: {ctx.get('overall_score', 'N/A')}/100"
             cost = float(ctx.get("cost", 0) or 0)
             sell = float(ctx.get("price", 0) or ctx.get("sell_price", 0) or 0)
-            return f"<b>Deep Analysis</b>\n\n<b>{ctx.get('product_title', 'Product')}</b>\n\nScores:\n{score_lines}\n\nCost: ${cost:.2f} -> Sell: ${sell:.2f}\nMargin: {margin:.1f}%"
-
+            return f"<b>Deep Analysis</b>\n\n<b>{ctx.get('product_title', 'Product')}</b>\n\nScores:\n{sl}\n\nCost: ${cost:.2f} -> Sell: ${sell:.2f}\nMargin: {((sell - cost) / cost * 100) if cost > 0 else 0:.1f}%"
         elif action == "chat":
-            result = await db.execute(select(Decision).where(Decision.id == decision_id))
-            decision = result.scalar_one_or_none()
-            if not decision:
-                return f"Decision {decision_id} not found"
-            ctx = decision.context_json or {}
-            title = ctx.get("product_title", "this product")
-            return f"<b>AI Chat Mode</b> - {title}\n\nAsk me anything about this product:\n- What's the profit margin?\n- Who's the target audience?\n- Write me an ad headline\n\nJust reply normally!"
-
-        else:
-            return f"Unknown action: {action}"
-
+            res = await db.execute(select(Decision).where(Decision.id == did))
+            d = res.scalar_one_or_none()
+            if not d: return f"Decision {did} not found"
+            ctx = d.context_json or {}
+            return f"<b>AI Chat Mode</b> - {ctx.get('product_title', 'this product')}\n\nAsk me anything:\n- What's the profit margin?\n- Who's the target audience?\n- Write me an ad headline\n\nJust reply normally!"
+        else: return f"Unknown action: {action}"
     elif prefix == "ad":
-        shopify_id = entity_id
-        if action == "launch":
-            return f"<b>Launching Facebook Ad</b>\nID: {shopify_id}\n\nConnect Facebook Marketing API to proceed."
-        elif action == "edit":
-            return f"<b>Edit Ad Copy</b>\nID: {shopify_id}\n\nReply with improved ad text."
-        elif action == "skip":
-            return f"<b>Ad Skipped</b>\nID: {shopify_id}\nProduct remains on Shopify."
-        else:
-            return f"Unknown ad action: {action}"
+        if action == "launch": return f"<b>Launching Facebook Ad</b>\nID: {eid}\n\nConnect Facebook Marketing API to proceed."
+        elif action == "edit": return f"<b>Edit Ad Copy</b>\nID: {eid}\n\nReply with improved ad text."
+        elif action == "skip": return f"<b>Ad Skipped</b>\nID: {eid}\nProduct remains on Shopify."
+        else: return f"Unknown ad action: {action}"
+    else: return f"Unknown prefix: {prefix}"
 
-    else:
-        return f"Unknown prefix: {prefix}"
-
-
-async def _handle_message(message_text: str, chat_id: str, db: AsyncSession) -> str:
+async def handle_msg(text: str, chat_id: str, db: AsyncSession) -> str:
     try:
-        result = await ai_engine.process_message(message_text, chat_id=chat_id)
-        return result.get("message", "Processing...") if isinstance(result, dict) else str(result)
-    except Exception as exc:
-        return f"AI error: {str(exc)[:200]}"
-
+        r = await ai_engine.process_message(text, chat_id=chat_id)
+        return r.get("message", "Processing...") if isinstance(r, dict) else str(r)
+    except Exception as e: return f"AI error: {str(e)[:200]}"
 
 @router.post("/webhook")
-async def telegram_webhook(request: Request, db: AsyncSession = Depends(_get_db)):
+async def telegram_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     try:
         data = await request.json()
-
         if "callback_query" in data:
             cbq = data["callback_query"]
-            query_data = cbq.get("data", "")
-            chat_id = str(cbq.get("message", {}).get("chat", {}).get("id", _chat_id()))
-            callback_id = cbq.get("id", "")
-
-            response_text = await _handle_callback(query_data, chat_id, db)
-            await _answer_callback(callback_id, "Done!")
-            if response_text:
-                await _send_message(chat_id, response_text)
+            qd = cbq.get("data", "")
+            cid = str(cbq.get("message", {}).get("chat", {}).get("id", CHAT_ID))
+            cbid = cbq.get("id", "")
+            resp = await handle_cb(qd, cid, db)
+            await answer_cb(cbid, "Done!")
+            if resp: await send_msg(cid, resp)
             return {"ok": True}
-
         if "message" in data:
             msg = data["message"]
-            chat_id = str(msg.get("chat", {}).get("id", _chat_id()))
+            cid = str(msg.get("chat", {}).get("id", CHAT_ID))
             text = msg.get("text", "")
-            if not text:
-                return {"ok": True}
-            response = await _handle_message(text, chat_id, db)
-            await _send_message(chat_id, response)
+            if not text: return {"ok": True}
+            resp = await handle_msg(text, cid, db)
+            await send_msg(cid, resp)
             return {"ok": True}
-
         return {"ok": True}
-
-    except HTTPException:
-        raise
-    except Exception:
-        raise HTTPException(status_code=500, detail="Webhook error")
+    except HTTPException: raise
+    except Exception: raise HTTPException(status_code=500, detail="Webhook error")
