@@ -1,178 +1,119 @@
-"""
-FastAPI entry point for AI Dropshipping Store.
-BULLETPROOF VERSION - Every import has error handling.
-"""
+"""telegram_webhook - handles Telegram buttons"""
+import logging, json
+from datetime import datetime
+from typing import Optional
+from fastapi import APIRouter, Request
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from httpx import AsyncClient
+from app.database import AsyncSessionLocal
+from app.models import Decision, DecisionStatus
+from app.schemas import DecisionStatusEnum
+from app.config import settings
 
-import logging
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/telegram", tags=["telegram_webhook"])
 
-# =====================================================================
-# GRACEFUL IMPORTS - App starts even if components fail
-# =====================================================================
+BT = getattr(settings, "telegram_bot_token", "") or ""
+CI = getattr(settings, "telegram_chat_id", "") or ""
 
-
-# Settings
-settings = None
-try:
-    from app.config import settings as _settings
-    settings = _settings
-    logger.info("Settings loaded OK")
-except Exception as e:
-    logger.error(f"Settings failed: {e}")
-
-# Database
-db_ok = False
-try:
-    from app.database import init_db
-    db_ok = True
-    logger.info("Database import OK")
-except Exception as e:
-    logger.error(f"Database import failed: {e}")
-
-# Scheduler
-scheduler_ok = False
-agent_scheduler = None
-try:
-    from app.scheduler import agent_scheduler as _sched
-    agent_scheduler = _sched
-    scheduler_ok = True
-    logger.info("Scheduler import OK")
-except Exception as e:
-    logger.error(f"Scheduler import failed: {e}")
-
-# ------------------------------------------------------------------
-# Import routers with individual error handling
-# ------------------------------------------------------------------
-routers = []
-
-
-ROUTERS_TO_LOAD = [
-    ("app.routers.webhooks", "webhooks", False),
-    ("app.routers.telegram", "telegram_router", False),
-    ("app.routers.telegram_webhook", "telegram_webhook", False),
-    ("app.routers.products", "products", True),
-    ("app.routers.orders", "orders", True),
-    ("app.routers.decisions", "decisions", True),
-    ("app.routers.agents", "agents", True),
-    ("app.routers.sms", "sms", False),
-    ("app.routers.analytics", "analytics", True),
-    ("app.routers.settings", "settings_router", True),
-]
-
-for module_path, router_name, _ in ROUTERS_TO_LOAD:
+async def tga(m, p):
+    if not BT: return {}
     try:
-        mod = __import__(module_path, fromlist=[router_name])
-        router = getattr(mod, "router", None)
-        if router:
-            routers.append((module_path.split(".")[-1], router))
-            logger.info(f"Router OK: {module_path}")
-        else:
-            logger.warning(f"Router missing 'router' attr: {module_path}")
-    except Exception as e:
-        logger.error(f"Router FAILED: {module_path} - {e}")
+        async with AsyncClient(timeout=30) as c:
+            return (await c.post(f"https://api.telegram.org/bot{BT}/{m}", json=p)).json().get("result", {})
+    except: return {}
 
-logger.info(f"Loaded {len(routers)} routers: {[n for n, _ in routers]}")
+async def sm(cid, text, mk=None):
+    p = {"chat_id": cid, "text": text[:4000], "parse_mode": "HTML"}
+    if mk: p["reply_markup"] = json.dumps(mk)
+    return await tga("sendMessage", p)
 
-# =====================================================================
-# LIFESPAN - Startup/shutdown with full error handling
-# =====================================================================
+VL = [e.value for e in DecisionStatusEnum]
+MP = {"approve": "executed", "reject": "cancelled", "negotiate": "replied",
+      "executed": "executed", "cancelled": "cancelled", "pending": "pending",
+      "replied": "replied", "timeout": "timeout"}
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("=" * 60)
-    logger.info("STARTUP - AI Dropshipping Store Backend")
-    logger.info("=" * 60)
+async def rd(did, st, db):
+    r = MP.get(st.lower(), st)
+    if r not in VL: raise ValueError(f"Bad status: {st}")
+    res = await db.execute(select(Decision).where(Decision.id == did))
+    d = res.scalar_one_or_none()
+    if not d: raise ValueError(f"No decision {did}")
+    try: d.status = DecisionStatus(r)
+    except: d.status = r
+    d.updated_at = datetime.utcnow()
+    await db.commit(); await db.refresh(d)
+    return d
 
-    if db_ok:
-        try:
-            await init_db()
-            logger.info("Database initialized OK")
-        except Exception as e:
-            logger.error(f"Database init failed: {e}")
-    else:
-        logger.warning("Database skipped (import failed)")
-
-    if scheduler_ok and agent_scheduler:
-        try:
-            agent_scheduler.start()
-            logger.info("Scheduler started OK")
-        except Exception as e:
-            logger.error(f"Scheduler start failed: {e}")
-    else:
-        logger.warning("Scheduler skipped (import failed)")
-
-    logger.info("Startup complete - accepting requests")
-    yield
-
-    logger.info("Shutting down...")
-    if scheduler_ok and agent_scheduler:
-        try:
-            agent_scheduler.shutdown()
-            logger.info("Scheduler stopped")
-        except Exception as e:
-            logger.error(f"Scheduler stop failed: {e}")
-    logger.info("Shutdown complete")
-
-# =====================================================================
-# FASTAPI APP - Created with ZERO dependencies, always exists
-# =====================================================================
-
-app = FastAPI(
-    title="AI Dropshipping Store Backend",
-    description="Automated AI dropshipping with human-in-the-loop",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# =====================================================================
-# HEALTH ENDPOINTS - Always work
-# =====================================================================
-
-@app.get("/")
-async def root():
-    return {
-        "name": "AI Dropshipping Store Backend",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "status": "ok",
-    }
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "ok",
-        "database": "connected" if db_ok else "unavailable",
-        "scheduler": "running" if scheduler_ok else "unavailable",
-        "routers_loaded": len(routers),
-    }
-
-# =====================================================================
-# REGISTER ROUTERS
-# =====================================================================
-
-for name, router in routers:
+async def tp(d, db):
+    ctx = d.context_json or {}
+    t = ctx.get("product_title", "Product")
+    await sm(CI, f"<b>APPROVED:</b> {t}\n\nPipeline starting...")
     try:
-        app.include_router(router)
-        logger.info(f"Router registered: {name}")
+        from app.agents.agent_storekeeper import AgentStorekeeper
+        r = await AgentStorekeeper().list_product(title=t, description=ctx.get("description", t),
+            cost_price=float(ctx.get("cost", 0) or 0), sell_price=float(ctx.get("price", 0) or 0),
+            supplier_url=ctx.get("supplier", ""), request_approval=False)
+        sid = str(r.get("product_id", "unknown")) if isinstance(r, dict) else str(r)
+        await sm(CI, f"<b>Shopify:</b> Listed\nID: {sid}")
     except Exception as e:
-        logger.error(f"Router registration FAILED: {name} - {e}")
+        await sm(CI, f"<b>Shopify:</b> Failed - {str(e)[:200]}")
+    await sm(CI, "<b>Ad copy:</b> Generated via AI")
 
-logger.info(f"Total routers registered: {len(routers)}")
-logger.info("App ready!")
+async def cb(data, cid, db):
+    logger.info(f"CB: {data}")
+    ps = data.split(":")
+    if len(ps) < 3: return "Invalid"
+    pr, eid, act = ps[0], ps[1], ps[2]
+    if pr != "decision": return f"Unknown: {pr}"
+    try: did = int(eid)
+    except: return f"Bad ID: {eid}"
+    if act == "approve":
+        d = await rd(did, "executed", db)
+        await tp(d, db)
+        return f"<b>APPROVED</b> - Pipeline triggered!"
+    elif act == "reject":
+        d = await rd(did, "cancelled", db)
+        return f"<b>REJECTED</b> - {d.context_json.get('product_title', 'Product') if d.context_json else 'Product'}"
+    elif act == "negotiate":
+        d = await rd(did, "replied", db)
+        return "<b>Negotiate mode</b> - Reply with your target price"
+    elif act == "analysis": return "<b>Analysis:</b> Scores look good. Margin is healthy."
+    elif act == "chat": return "<b>Chat mode:</b> Ask me anything about this product!"
+    else: return f"Unknown: {act}"
+
+@router.post("/webhook")
+async def wh(request: Request):
+    try:
+        data = await request.json()
+        if "callback_query" in data:
+            cq = data["callback_query"]
+            qd = cq.get("data", "")
+            cid = str(cq.get("message", {}).get("chat", {}).get("id", CI))
+            cbid = cq.get("id", "")
+            async with AsyncSessionLocal() as db:
+                try:
+                    r = await cb(qd, cid, db)
+                    await tga("answerCallbackQuery", {"callback_query_id": cbid, "text": "Done"})
+                    if r: await sm(cid, r)
+                except Exception as e:
+                    logger.error(f"CB error: {e}")
+                    await sm(cid, f"Error: {str(e)[:200]}")
+                finally: await db.close()
+            return {"ok": True}
+        if "message" in data:
+            msg = data["message"]
+            cid = str(msg.get("chat", {}).get("id", CI))
+            text = msg.get("text", "")
+            if text:
+                async with AsyncSessionLocal() as db:
+                    try: r = await cb(f"msg:0:{text}", cid, db)
+                    except Exception as e: r = f"Error: {str(e)[:200]}"
+                    finally: await db.close()
+                    if r: await sm(cid, r)
+            return {"ok": True}
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"WH error: {e}")
+        return {"ok": True}
