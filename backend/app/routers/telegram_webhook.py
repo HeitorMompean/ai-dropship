@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Request
+from fastapi import FastAPI
 
-router = APIRouter(prefix="/telegram", tags=["telegram_webhook"])
+app = FastAPI()
 
-@router.post("/webhook")
-async def telegram_webhook(request: Request):
-    return {"ok": True}
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
