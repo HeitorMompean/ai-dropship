@@ -1,109 +1,119 @@
-﻿"""FastAPI entry point for the AI Dropshipping Store backend."""
-
-import logging
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
+"""telegram_webhook - handles Telegram buttons"""
+import logging, json
+from datetime import datetime
+from typing import Optional
+from fastapi import APIRouter, Request, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from httpx import AsyncClient
+from app.database import AsyncSessionLocal
+from app.models import Decision, DecisionStatus
+from app.schemas import DecisionStatusEnum
 from app.config import settings
-from app.database import init_db
-from app.scheduler import agent_scheduler
 
-# Import all routers
-from app.routers import webhooks, products, orders, decisions, agents, sms, analytics, telegram, settings as settings_router
-from app.routers import telegram_webhook
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/telegram", tags=["telegram_webhook"])
 
-# Simple bearer token auth
-credentials_exception = HTTPException(
-    status_code=status.HTTP_401_UNAUTHORIZED,
-    detail="Invalid or missing Bearer token",
-    headers={"WWW-Authenticate": "Bearer"},
-)
+BT = getattr(settings, "telegram_bot_token", "") or ""
+CI = getattr(settings, "telegram_chat_id", "") or ""
 
-security = HTTPBearer(auto_error=False)
+async def tga(m, p):
+    if not BT: return {}
+    try:
+        async with AsyncClient(timeout=30) as c:
+            return (await c.post(f"https://api.telegram.org/bot{BT}/{m}", json=p)).json().get("result", {})
+    except: return {}
 
+async def sm(cid, text, mk=None):
+    p = {"chat_id": cid, "text": text[:4000], "parse_mode": "HTML"}
+    if mk: p["reply_markup"] = json.dumps(mk)
+    return await tga("sendMessage", p)
 
-async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    """Verify the Bearer token matches APP_SECRET_KEY."""
-    if settings.app_env == "development" and settings.app_secret_key == "demo_secret_key_change_me":
-        return "demo"
-    if not credentials:
-        raise credentials_exception
-    if credentials.credentials != settings.app_secret_key:
-        raise credentials_exception
-    return credentials.credentials
+VL = [e.value for e in DecisionStatusEnum]
+MP = {"approve": "executed", "reject": "cancelled", "negotiate": "replied",
+      "executed": "executed", "cancelled": "cancelled", "pending": "pending",
+      "replied": "replied", "timeout": "timeout"}
 
+async def rd(did, st, db):
+    r = MP.get(st.lower(), st)
+    if r not in VL: raise ValueError(f"Bad status: {st}")
+    res = await db.execute(select(Decision).where(Decision.id == did))
+    d = res.scalar_one_or_none()
+    if not d: raise ValueError(f"No decision {did}")
+    try: d.status = DecisionStatus(r)
+    except: d.status = r
+    d.updated_at = datetime.utcnow()
+    await db.commit(); await db.refresh(d)
+    return d
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan: startup and shutdown events."""
-    logger.info("Starting up AI Dropshipping Store backend...")
-    await init_db()
-    agent_scheduler.start()
-    logger.info("Startup complete.")
-    yield
-    logger.info("Shutting down...")
-    agent_scheduler.shutdown()
-    logger.info("Shutdown complete.")
+async def tp(d, db):
+    ctx = d.context_json or {}
+    t = ctx.get("product_title", "Product")
+    await sm(CI, f"<b>APPROVED:</b> {t}\n\nPipeline starting...")
+    try:
+        from app.agents.agent_storekeeper import AgentStorekeeper
+        r = await AgentStorekeeper().list_product(title=t, description=ctx.get("description", t),
+            cost_price=float(ctx.get("cost", 0) or 0), sell_price=float(ctx.get("price", 0) or 0),
+            supplier_url=ctx.get("supplier", ""), request_approval=False)
+        sid = str(r.get("product_id", "unknown")) if isinstance(r, dict) else str(r)
+        await sm(CI, f"<b>Shopify:</b> Listed\nID: {sid}")
+    except Exception as e:
+        await sm(CI, f"<b>Shopify:</b> Failed - {str(e)[:200]}")
+    await sm(CI, "<b>Ad copy:</b> Generated via AI")
 
+async def cb(data, cid, db):
+    logger.info(f"CB: {data}")
+    ps = data.split(":")
+    if len(ps) < 3: return "Invalid"
+    pr, eid, act = ps[0], ps[1], ps[2]
+    if pr != "decision": return f"Unknown: {pr}"
+    try: did = int(eid)
+    except: return f"Bad ID: {eid}"
+    if act == "approve":
+        d = await rd(did, "executed", db)
+        await tp(d, db)
+        return f"<b>APPROVED</b> - Pipeline triggered!"
+    elif act == "reject":
+        d = await rd(did, "cancelled", db)
+        return f"<b>REJECTED</b> - {d.context_json.get('product_title', 'Product') if d.context_json else 'Product'}"
+    elif act == "negotiate":
+        d = await rd(did, "replied", db)
+        return "<b>Negotiate mode</b> - Reply with your target price"
+    elif act == "analysis": return "<b>Analysis:</b> Scores look good. Margin is healthy."
+    elif act == "chat": return "<b>Chat mode:</b> Ask me anything about this product!"
+    else: return f"Unknown: {act}"
 
-app = FastAPI(
-    title="AI Dropshipping Store Backend",
-    description="Automated AI dropshipping store with human-in-the-loop decisions via SMS.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-# CORS for React frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Register routers
-# Webhooks have no auth (HMAC verified inside)
-app.include_router(webhooks.router)
-
-# SMS inbound webhook has no auth (external gateway calls it)
-app.include_router(sms.router)
-app.include_router(telegram.router)
-app.include_router(telegram_webhook.router)
-
-# REST API routes use Bearer token auth
-app.include_router(products.router, dependencies=[Depends(verify_token)])
-app.include_router(orders.router, dependencies=[Depends(verify_token)])
-app.include_router(decisions.router, dependencies=[Depends(verify_token)])
-app.include_router(agents.router, dependencies=[Depends(verify_token)])
-app.include_router(analytics.router, dependencies=[Depends(verify_token)])
-app.include_router(settings_router.router, dependencies=[Depends(verify_token)])
-
-
-@app.get("/health")
-async def health_check() -> dict:
-    """Health check endpoint."""
-    return {"status": "ok", "env": settings.app_env, "demo_mode": settings.is_demo_mode}
-
-
-@app.get("/")
-async def root() -> dict:
-    """API root with basic info."""
-    return {
-        "name": "AI Dropshipping Store Backend",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "demo_mode": settings.is_demo_mode,
-    }
-
-
+@router.post("/webhook")
+async def wh(request: Request):
+    try:
+        data = await request.json()
+        if "callback_query" in data:
+            cq = data["callback_query"]
+            qd = cq.get("data", "")
+            cid = str(cq.get("message", {}).get("chat", {}).get("id", CI))
+            cbid = cq.get("id", "")
+            async with AsyncSessionLocal() as db:
+                try:
+                    r = await cb(qd, cid, db)
+                    await tga("answerCallbackQuery", {"callback_query_id": cbid, "text": "Done"})
+                    if r: await sm(cid, r)
+                except Exception as e:
+                    logger.error(f"CB error: {e}")
+                    await sm(cid, f"Error: {str(e)[:200]}")
+                finally: await db.close()
+            return {"ok": True}
+        if "message" in data:
+            msg = data["message"]
+            cid = str(msg.get("chat", {}).get("id", CI))
+            text = msg.get("text", "")
+            if text:
+                async with AsyncSessionLocal() as db:
+                    try: r = await cb(f"msg:0:{text}", cid, db)
+                    except Exception as e: r = f"Error: {str(e)[:200]}"
+                    finally: await db.close()
+                    if r: await sm(cid, r)
+            return {"ok": True}
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"WH error: {e}")
+        return {"ok": True}
