@@ -1,127 +1,112 @@
 """
-FastAPI entry point for AI Dropshipping Store.
-BULLETPROOF VERSION - Every import has error handling.
+FastAPI entry point - reads PORT from Railway environment
 """
-
+import os
 import logging
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
+# Read PORT from Railway (falls back to 8000 for local dev)
+PORT = int(os.environ.get("PORT", "8000"))
+logger.info(f"Configured to use PORT: {PORT}")
+
 # =====================================================================
-# GRACEFUL IMPORTS - App starts even if components fail
+# GRACEFUL IMPORTS
 # =====================================================================
 
-# Settings
 settings = None
 try:
-    from app.config import settings as _settings
-    settings = _settings
-    logger.info("Settings loaded OK")
+    from app.config import settings as _s
+    settings = _s
+    logger.info("Settings OK")
 except Exception as e:
-    logger.error(f"Settings failed: {e}")
+    logger.error(f"Settings fail: {e}")
 
-# Database
 db_ok = False
 try:
     from app.database import init_db
     db_ok = True
-    logger.info("Database import OK")
+    logger.info("Database OK")
 except Exception as e:
-    logger.error(f"Database import failed: {e}")
+    logger.error(f"Database fail: {e}")
 
-# Scheduler
 scheduler_ok = False
 agent_scheduler = None
 try:
-    from app.scheduler import agent_scheduler as _sched
-    agent_scheduler = _sched
+    from app.scheduler import agent_scheduler as _s
+    agent_scheduler = _s
     scheduler_ok = True
-    logger.info("Scheduler import OK")
+    logger.info("Scheduler OK")
 except Exception as e:
-    logger.error(f"Scheduler import failed: {e}")
+    logger.error(f"Scheduler fail: {e}")
 
-# ------------------------------------------------------------------
-# Import routers with individual error handling
-# ------------------------------------------------------------------
 routers = []
-
 ROUTERS_TO_LOAD = [
-    ("app.routers.webhooks", "webhooks", False),
-    ("app.routers.telegram", "telegram_router", False),
-    ("app.routers.telegram_webhook", "telegram_webhook", False),
-    ("app.routers.products", "products", True),
-    ("app.routers.orders", "orders", True),
-    ("app.routers.decisions", "decisions", True),
-    ("app.routers.agents", "agents", True),
-    ("app.routers.sms", "sms", False),
-    ("app.routers.analytics", "analytics", True),
-    ("app.routers.settings", "settings_router", True),
+    ("app.routers.webhooks", False),
+    ("app.routers.telegram", False),
+    ("app.routers.telegram_webhook", False),
+    ("app.routers.products", True),
+    ("app.routers.orders", True),
+    ("app.routers.decisions", True),
+    ("app.routers.agents", True),
+    ("app.routers.sms", False),
+    ("app.routers.analytics", True),
+    ("app.routers.settings", True),
 ]
 
-for module_path, router_name, _ in ROUTERS_TO_LOAD:
+for module_path, _ in ROUTERS_TO_LOAD:
     try:
-        mod = __import__(module_path, fromlist=[router_name])
+        mod = __import__(module_path, fromlist=["router"])
         router = getattr(mod, "router", None)
         if router:
             routers.append((module_path.split(".")[-1], router))
             logger.info(f"Router OK: {module_path}")
-        else:
-            logger.warning(f"Router missing 'router' attr: {module_path}")
     except Exception as e:
-        logger.error(f"Router FAILED: {module_path} - {e}")
+        logger.error(f"Router FAIL: {module_path} - {e}")
 
-logger.info(f"Loaded {len(routers)} routers: {[n for n, _ in routers]}")
+logger.info(f"Loaded {len(routers)} routers")
 
 # =====================================================================
-# LIFESPAN - Startup/shutdown with full error handling
+# LIFESPAN
 # =====================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=" * 60)
-    logger.info("STARTUP - AI Dropshipping Store Backend")
+    logger.info("STARTUP")
     logger.info("=" * 60)
 
     if db_ok:
         try:
             await init_db()
-            logger.info("Database initialized OK")
+            logger.info("DB init OK")
         except Exception as e:
-            logger.error(f"Database init failed: {e}")
-    else:
-        logger.warning("Database skipped (import failed)")
+            logger.error(f"DB init fail: {e}")
 
     if scheduler_ok and agent_scheduler:
         try:
             agent_scheduler.start()
-            logger.info("Scheduler started OK")
+            logger.info("Scheduler started")
         except Exception as e:
-            logger.error(f"Scheduler start failed: {e}")
-    else:
-        logger.warning("Scheduler skipped (import failed)")
+            logger.error(f"Scheduler fail: {e}")
 
-    logger.info("Startup complete - accepting requests")
+    logger.info("Ready - accepting requests")
     yield
 
     logger.info("Shutting down...")
     if scheduler_ok and agent_scheduler:
         try:
             agent_scheduler.shutdown()
-            logger.info("Scheduler stopped")
-        except Exception as e:
-            logger.error(f"Scheduler stop failed: {e}")
-    logger.info("Shutdown complete")
+        except:
+            pass
+    logger.info("Done")
 
 # =====================================================================
-# FASTAPI APP
+# APP
 # =====================================================================
 
 app = FastAPI(
@@ -140,37 +125,36 @@ app.add_middleware(
 )
 
 # =====================================================================
-# HEALTH ENDPOINTS
+# HEALTH
 # =====================================================================
 
 @app.get("/")
 async def root():
-    return {
-        "name": "AI Dropshipping Store Backend",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "status": "ok",
-    }
+    return {"name": "AI Dropshipping Store Backend", "version": "1.0.0", "status": "ok"}
 
 @app.get("/health")
-async def health_check():
-    return {
-        "status": "ok",
-        "database": "connected" if db_ok else "unavailable",
-        "scheduler": "running" if scheduler_ok else "unavailable",
-        "routers_loaded": len(routers),
-    }
+async def health():
+    return {"status": "ok", "database": "ok" if db_ok else "fail", "scheduler": "ok" if scheduler_ok else "fail", "routers": len(routers)}
 
 # =====================================================================
-# REGISTER ROUTERS
+# ROUTERS
 # =====================================================================
 
 for name, router in routers:
     try:
         app.include_router(router)
-        logger.info(f"Router registered: {name}")
+        logger.info(f"Registered: {name}")
     except Exception as e:
-        logger.error(f"Router registration FAILED: {name} - {e}")
+        logger.error(f"Register FAIL: {name} - {e}")
 
-logger.info(f"Total routers registered: {len(routers)}")
+logger.info(f"Total: {len(routers)} routers")
 logger.info("App ready!")
+
+# =====================================================================
+# STARTUP - When run directly, use the PORT from env
+# =====================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info(f"Starting uvicorn on port {PORT}")
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
