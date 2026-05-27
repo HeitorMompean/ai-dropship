@@ -2,6 +2,8 @@
 import logging, random, re, urllib.parse
 from typing import Any, Dict, List
 import httpx
+import os
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 SUBS = [
@@ -64,19 +66,56 @@ class ScraperService:
                 "Cache-Control": "max-age=0",
             }, follow_redirects=True)
         return self._c
-
     async def _rd(self, sub, limit=25):
+        """Scrape Reddit via ScrapingBee proxy to bypass cloud IP blocks and API restrictions."""
         try:
-            c = await self._hc()
-            r = await c.get(f"https://www.reddit.com/r/{sub}/.json?limit={limit}")
-            r.raise_for_status()
-            posts = r.json().get("data",{}).get("children",[])
-            return [{"title":d.get("title",""),"score":d.get("score",0),
-                     "ratio":d.get("upvote_ratio",0.9),"sub":sub}
-                    for p in posts for d in [p.get("data",{})]
-                    if not d.get("stickied") and d.get("score",0)>=50]
-        except Exception as e: logger.error("r/%s: %s",sub,e); return []
-
+            scrapingbee_key = os.getenv("SCRAPINGBEE_API_KEY")
+            
+            if not scrapingbee_key:
+                logger.error("SCRAPINGBEE_API_KEY not set - get free key at scrapingbee.com")
+                return []
+            
+            # Use ScrapingBee to scrape Reddit as a website (not API)
+            reddit_url = f"https://www.reddit.com/r/{sub}/.json?limit={limit}"
+            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(reddit_url)}&render_js=false&premium_proxy=true"
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(proxy_url, headers=headers)
+                response.raise_for_status()
+                
+                data = response.json()
+                posts = data.get("data", {}).get("children", [])
+                
+                results = []
+                for p in posts:
+                    post_data = p.get("data", {})
+                    if post_data.get("stickied") or post_data.get("over_18"):
+                        continue
+                    if post_data.get("score", 0) >= 50:
+                        results.append({
+                            "title": post_data.get("title", ""),
+                            "score": post_data.get("score", 0),
+                            "ratio": post_data.get("upvote_ratio", 0.9),
+                            "sub": sub,
+                            "url": post_data.get("url", ""),
+                            "permalink": f"https://reddit.com{post_data.get('permalink', '')}"
+                        })
+                
+                return results
+                
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                logger.error(f"ScrapingBee blocked on r/{sub} - check API key quota")
+            else:
+                logger.error(f"HTTP {e.response.status_code} on r/{sub}")
+            return []
+        except Exception as e:
+            logger.error(f"ScrapingBee error on r/{sub}: {type(e).__name__} - {e}")
+            return []
     def _clean(self, t):
         t = re.sub(r"\[.*?\]|\(.*?\)","",t)
         t = re.sub(r"\$\d+[\d,.]*|\d+%\s+off","",t,flags=re.I)
