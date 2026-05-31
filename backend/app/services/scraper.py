@@ -1,22 +1,14 @@
-﻿"""Real product scraper - Reddit + AliExpress."""
-import logging, random, re, urllib.parse
+"""Real product scraper - Reddit via ScrapingBee + AliExpress."""
+import logging, random, re, urllib.parse, os
 from typing import Any, Dict, List
 import httpx
-import os
-import urllib.parse
 
 logger = logging.getLogger(__name__)
+
 SUBS = [
-    "shutupandtakemymoney",
-    "BuyItForLife",
-    "FitnessGadgets",
-    "EDC",
-    "lifehacks",
-    "AmazonTopRated",
-    "skincareaddiction",
-    "Coffee",
-    "homeautomation",
-    "gadgets",
+    "shutupandtakemymoney", "BuyItForLife", "FitnessGadgets", "EDC",
+    "lifehacks", "AmazonTopRated", "skincareaddiction", "Coffee",
+    "homeautomation", "gadgets",
 ]
 
 NEWS_WORDS = {"reveals","leak","leaked","rumor","might","may","could",
@@ -47,49 +39,38 @@ PRODUCT_WORDS = {"gadget","device","tool","organizer","holder","stand",
     "posture corrector","resistance band","yoga mat","blender","coffee maker",
     "wireless charger","car mount","desk lamp","night light","essential oil"}
 
+
 class ScraperService:
-    def __init__(self): self._c = None
+    def __init__(self):
+        self._c = None
+
     async def _hc(self):
         if self._c is None or self._c.is_closed:
             self._c = httpx.AsyncClient(timeout=20.0, headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT": "1",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Cache-Control": "max-age=0",
+                "DNT": "1", "Connection": "keep-alive",
             }, follow_redirects=True)
         return self._c
+
     async def _rd(self, sub, limit=25):
-        """Scrape Reddit via ScrapingBee proxy to bypass cloud IP blocks and API restrictions."""
+        """Scrape Reddit via ScrapingBee proxy to bypass cloud IP blocks."""
         try:
             scrapingbee_key = os.getenv("SCRAPINGBEE_API_KEY")
-            
             if not scrapingbee_key:
-                logger.error("SCRAPINGBEE_API_KEY not set - get free key at scrapingbee.com")
+                logger.error("[SCRAPER] SCRAPINGBEE_API_KEY not set - get free key at scrapingbee.com")
                 return []
-            
-            # Use ScrapingBee to scrape Reddit as a website (not API)
+
             reddit_url = f"https://www.reddit.com/r/{sub}/.json?limit={limit}"
             proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(reddit_url)}&render_js=false&premium_proxy=true"
-            
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
-            
+
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(proxy_url, headers=headers)
+                response = await client.get(proxy_url, headers={"User-Agent": "Mozilla/5.0"})
                 response.raise_for_status()
-                
                 data = response.json()
                 posts = data.get("data", {}).get("children", [])
-                
+
                 results = []
                 for p in posts:
                     post_data = p.get("data", {})
@@ -104,38 +85,40 @@ class ScraperService:
                             "url": post_data.get("url", ""),
                             "permalink": f"https://reddit.com{post_data.get('permalink', '')}"
                         })
-                
                 return results
-                
+
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 403:
-                logger.error(f"ScrapingBee blocked on r/{sub} - check API key quota")
+                logger.error(f"[SCRAPER] ScrapingBee blocked on r/{sub} - check API key quota")
             else:
-                logger.error(f"HTTP {e.response.status_code} on r/{sub}")
+                logger.error(f"[SCRAPER] HTTP {e.response.status_code} on r/{sub}")
             return []
         except Exception as e:
-            logger.error(f"ScrapingBee error on r/{sub}: {type(e).__name__} - {e}")
+            logger.error(f"[SCRAPER] Error on r/{sub}: {type(e).__name__} - {e}")
             return []
+
     def _clean(self, t):
-        t = re.sub(r"\[.*?\]|\(.*?\)","",t)
-        t = re.sub(r"\$\d+[\d,.]*|\d+%\s+off","",t,flags=re.I)
-        t = re.sub(r"[|•—-]\s*"," ",t)
-        t = re.sub(r"https?://\S+","",t)
-        t = re.sub(r"\s+"," ",t).strip()
+        t = re.sub(r"\[.*?\]|\(.*?\)", "", t)
+        t = re.sub(r"\$\d+[\d,.]*|\d+%\s+off", "", t, flags=re.I)
+        t = re.sub(r"[|•—-]\s*", " ", t)
+        t = re.sub(r"https?://\S+", "", t)
+        t = re.sub(r"\s+", " ", t).strip()
         return t.strip(" .,!")
 
     def _is_product(self, title):
         t = title.lower()
-        if any(w in t for w in NEWS_WORDS): return False
-        if any(w in t for w in PRODUCT_WORDS): return True
+        if any(w in t for w in NEWS_WORDS):
+            return False
+        if any(w in t for w in PRODUCT_WORDS):
+            return True
         return False
 
     def _extract_name(self, title):
         t = title.lower().strip()
-        for pat in [r"leak reveals.*$",r"might.*$",r"could.*$",r"will.*$",
-                    r"announces.*$",r"launches.*$",r"update.*$",r"report.*$",
-                    r"exclusive.*$",r"breaking.*$",r"rumor.*$",r"is a.*$",
-                    r"for cutting.*$",r"a ['']gamechanger[''].*$"]:
+        for pat in [r"leak reveals.*$", r"might.*$", r"could.*$", r"will.*$",
+                    r"announces.*$", r"launches.*$", r"update.*$", r"report.*$",
+                    r"exclusive.*$", r"breaking.*$", r"rumor.*$", r"is a.*$",
+                    r"for cutting.*$", r"a ['']gamechanger[''].*$"]:
             t = re.sub(pat, "", t, flags=re.I)
         for pat in [r"(?:this|my|the)\s+(?:new\s+)?(.+?)\s+(?:is|changed|saved|helped|works)",
                     r"bought\s+(?:this|a|an)\s+(.+?)(?:\s+and|\s+for|\s+on|\s+from|$)",
@@ -152,46 +135,63 @@ class ScraperService:
 
     async def _tr(self, kw):
         rng = random.Random(sum(ord(c) for c in kw))
-        i = rng.randint(35,95)
-        return {"interest_score":i,"trend_direction":"rising" if i>60 else "stable"}
+        i = rng.randint(35, 95)
+        return {"interest_score": i, "trend_direction": "rising" if i > 60 else "stable"}
 
     async def _al(self, q):
         try:
             c = await self._hc()
-            r = await c.get(f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(q)}",timeout=15)
-            if r.status_code != 200: return []
-            prices = re.findall(r'"formatedAmount":"\$(\d+[\d,.]*)"',r.text)
-            titles = re.findall(r'"title":"([^"]{10,80})"',r.text)
-            return [{"title":t,"price":float(p.replace(",",""))}
-                    for t,p in zip(titles[:5],prices[:5]) if float(p.replace(",",""))>0.5][:5]
-        except Exception as e: logger.error("ali %s: %s",q,e); return []
+            r = await c.get(f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(q)}", timeout=15)
+            if r.status_code != 200:
+                return []
+            prices = re.findall(r'"formatedAmount":"\$(\d+[\d,.]*)"', r.text)
+            titles = re.findall(r'"title":"([^"]{10,80})"', r.text)
+            return [{"title": t, "price": float(p.replace(",", ""))}
+                    for t, p in zip(titles[:5], prices[:5]) if float(p.replace(",", "")) > 0.5][:5]
+        except Exception as e:
+            logger.error("[SCRAPER] ali %s: %s", q, e)
+            return []
 
     def _cost(self, ali):
-        prices = [p["price"] for p in ali if p["price"]>0.5]
-        if not prices: return 5.0, 29.99
-        avg = sum(prices)/len(prices)
-        return round(avg,2), round(avg*3.5,2)
+        prices = [p["price"] for p in ali if p["price"] > 0.5]
+        if not prices:
+            return 5.0, 29.99
+        avg = sum(prices) / len(prices)
+        return round(avg, 2), round(avg * 3.5, 2)
 
     def _score(self, cost, sell, interest, upvotes, ratio):
-        s = {k:7 for k in ["problem_solution","passionate_audience","profit_margin",
-            "perceived_value","impulse_potential","availability","trending","shipping",
-            "legal","repeat_purchase","visual_appeal","price_point","competitive_landscape"]}
+        s = {k: 7 for k in ["problem_solution", "passionate_audience", "profit_margin",
+            "perceived_value", "impulse_potential", "availability", "trending", "shipping",
+            "legal", "repeat_purchase", "visual_appeal", "price_point", "competitive_landscape"]}
         s["legal"] = 9
-        if upvotes>500: s["passionate_audience"]=9; s["impulse_potential"]=9
-        elif upvotes>200: s["passionate_audience"]=8; s["impulse_potential"]=8
-        if ratio>0.9: s["perceived_value"]=9
-        elif ratio>0.8: s["perceived_value"]=8
-        if interest>75: s["trending"]=9
-        elif interest>50: s["trending"]=8
-        if cost<5: s["price_point"]=9; s["impulse_potential"]+=1
-        elif cost<15: s["price_point"]=8
-        for k in s: s[k] = min(s[k],10)
+        if upvotes > 500:
+            s["passionate_audience"] = 9
+            s["impulse_potential"] = 9
+        elif upvotes > 200:
+            s["passionate_audience"] = 8
+            s["impulse_potential"] = 8
+        if ratio > 0.9:
+            s["perceived_value"] = 9
+        elif ratio > 0.8:
+            s["perceived_value"] = 8
+        if interest > 75:
+            s["trending"] = 9
+        elif interest > 50:
+            s["trending"] = 8
+        if cost < 5:
+            s["price_point"] = 9
+            s["impulse_potential"] += 1
+        elif cost < 15:
+            s["price_point"] = 8
+        for k in s:
+            s[k] = min(s[k], 10)
         return s
 
     async def scrape_trending_products(self, limit=10):
         logger.info("[SCRAPER] Starting")
         posts = []
-        for sub in SUBS: posts.extend(await self._rd(sub,25))
+        for sub in SUBS:
+            posts.extend(await self._rd(sub, 25))
         logger.info("[SCRAPER] %s raw posts from Reddit", len(posts))
 
         prods = []
@@ -200,34 +200,59 @@ class ScraperService:
                 continue
             name = self._extract_name(p["title"])
             if 5 < len(name) < 80:
-                prods.append({"name":name,"upvotes":p["score"],
-                              "ratio":p["ratio"],"sub":p["sub"]})
+                prods.append({"name": name, "upvotes": p["score"], "ratio": p["ratio"], "sub": p["sub"]})
 
-        prods.sort(key=lambda x:x["upvotes"],reverse=True)
+        prods.sort(key=lambda x: x["upvotes"], reverse=True)
         prods = prods[:15]
         logger.info("[SCRAPER] %s product candidates after filtering", len(prods))
-        for p in prods[:3]: logger.info("  - %s (from %s)", p["name"], p["sub"])
+        for p in prods[:3]:
+            logger.info("  - %s (from %s)", p["name"], p["sub"])
 
         results = []
         for pr in prods[:limit]:
             tr = await self._tr(pr["name"])
             ali = await self._al(pr["name"])
             cost, sell = self._cost(ali)
-            sc = self._score(cost,sell,tr["interest_score"],pr["upvotes"],pr["ratio"])
+            sc = self._score(cost, sell, tr["interest_score"], pr["upvotes"], pr["ratio"])
             total = sum(sc.values())
-            labels = {"problem_solution":"Problem/Solution","passionate_audience":"Passionate Audience","profit_margin":"Profit Margin","perceived_value":"Perceived Value","impulse_potential":"Impulse","availability":"Availability","trending":"Trending","shipping":"Shipping","legal":"Legal/Safe","repeat_purchase":"Repeat Purchase","visual_appeal":"Visual Appeal","price_point":"Price Point","competitive_landscape":"Competition"}
-            display = {labels.get(k,k):v for k,v in sc.items()}
-            src = {"reddit":{"subreddit":f"r/{pr['sub']}","upvotes":pr["upvotes"]},"google_trends":tr,"aliexpress_listings":len(ali)}
-            results.append({"title":pr["name"],"description":f"Trending on r/{pr['sub']} ({pr['upvotes']} upvotes). Trends: {tr['interest_score']}/100.","supplier_url":f"https://aliexpress.com/wholesale?SearchText={urllib.parse.quote(pr['name'])}","cost_price":cost,"suggested_sell_price":sell,"margin":round(sell-cost,2),"scores":display,"total_score":total,"source_data":src})
+            labels = {"problem_solution": "Problem/Solution", "passionate_audience": "Passionate Audience",
+                      "profit_margin": "Profit Margin", "perceived_value": "Perceived Value",
+                      "impulse_potential": "Impulse", "availability": "Availability", "trending": "Trending",
+                      "shipping": "Shipping", "legal": "Legal/Safe", "repeat_purchase": "Repeat Purchase",
+                      "visual_appeal": "Visual Appeal", "price_point": "Price Point",
+                      "competitive_landscape": "Competition"}
+            display = {labels.get(k, k): v for k, v in sc.items()}
+            src = {"reddit": {"subreddit": f"r/{pr['sub']}", "upvotes": pr["upvotes"]},
+                   "google_trends": tr, "aliexpress_listings": len(ali)}
+            results.append({
+                "title": pr["name"],
+                "description": f"Trending on r/{pr['sub']} ({pr['upvotes']} upvotes). Trends: {tr['interest_score']}/100.",
+                "supplier_url": f"https://aliexpress.com/wholesale?SearchText={urllib.parse.quote(pr['name'])}",
+                "cost_price": cost,
+                "suggested_sell_price": sell,
+                "margin": round(sell - cost, 2),
+                "scores": display,
+                "total_score": total,
+                "source_data": src
+            })
         logger.info("[SCRAPER] Done: %s products", len(results))
         return results
 
-    async def analyze_google_trends(self, kw): return await self._tr(kw)
+    async def analyze_google_trends(self, kw):
+        return await self._tr(kw)
+
     async def check_facebook_ads(self, kw):
-        tr = await self._tr(kw); i = tr.get("interest_score",50)
-        return {"keyword":kw,"active_ad_count":int(i*random.uniform(1.5,4.0)),"saturation":"low" if i<60 else "medium"}
-    async def scrape_competitor_price(self, url): return None
+        tr = await self._tr(kw)
+        i = tr.get("interest_score", 50)
+        return {"keyword": kw, "active_ad_count": int(i * random.uniform(1.5, 4.0)),
+                "saturation": "low" if i < 60 else "medium"}
+
+    async def scrape_competitor_price(self, url):
+        return None
+
     async def close(self):
-        if self._c and not self._c.is_closed: await self._c.aclose()
+        if self._c and not self._c.is_closed:
+            await self._c.aclose()
+
 
 scraper = ScraperService()
