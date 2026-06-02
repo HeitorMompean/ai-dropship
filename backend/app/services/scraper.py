@@ -190,8 +190,7 @@ class ScraperService:
     async def scrape_trending_products(self, limit=10):
         logger.info("[SCRAPER] Starting")
         
-        # 🚨 FORCE TEST MODE: Bypasses scraper to test Telegram & Shopify 🚨
-        # DELETE THIS BLOCK LATER once ScrapingBee key is fixed!
+               # 🚨 FORCE TEST MODE: Bypasses scraper to test Telegram & Shopify 🚨
         logger.warning("[SCRAPER] Running in FORCE TEST MODE (Fake Data)")
         return [
             {
@@ -201,8 +200,14 @@ class ScraperService:
                 "cost_price": 8.50,
                 "suggested_sell_price": 29.99,
                 "margin": 21.49,
-                "scores": {"Problem/Solution": 9, "Profit Margin": 9, "Trending": 9, "Impulse": 9},
-                "total_score": 95,
+                "scores": {
+                    "Problem/Solution": 9, "Passionate Audience": 9, "Profit Margin": 9,
+                    "Perceived Value": 9, "Impulse": 9, "Availability": 9,
+                    "Trending": 9, "Shipping": 9, "Legal/Safe": 9,
+                    "Repeat Purchase": 9, "Visual Appeal": 9, "Price Point": 9,
+                    "Competition": 9
+                },
+                "total_score": 117,
                 "source_data": {"reddit": {"subreddit": "r/gadgets", "upvotes": 1500}, "google_trends": {"interest_score": 85}}
             }
         ]
