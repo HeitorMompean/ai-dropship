@@ -3,7 +3,9 @@ import logging
 from typing import Any, Dict
 import httpx
 from datetime import datetime, timedelta, timezone
-
+import os
+import logging
+from typing import Any, Dict
 from app.agents.crew_setup import create_agent, wrap_async_tool
 from app.agents.tools import create_scrape_trending_products_tool, create_analyze_google_trends_tool, create_check_facebook_ads_tool, create_request_human_decision_tool
 from app.agents.memory import conversation_memory
