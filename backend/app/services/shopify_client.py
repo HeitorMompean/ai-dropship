@@ -15,7 +15,7 @@ class ShopifyClient:
     def __init__(self) -> None:
         self.shop_name = settings.shopify_shop_name
         self.access_token = settings.shopify_access_token
-        self.api_version = "2024-04"
+        self.api_version = "2026-06"
         self.base_url = f"https://{self.shop_name}/admin/api/{self.api_version}"
         self.demo_mode = settings.is_demo_mode
         self._client: Optional[httpx.AsyncClient] = None
