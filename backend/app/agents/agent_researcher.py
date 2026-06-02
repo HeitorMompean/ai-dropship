@@ -67,10 +67,13 @@ class AgentResearcher:
                     }
                     sms = f"Found '{p['title'][:40]}' on {reddit.get('subreddit', 'Reddit')} ({reddit.get('upvotes', 0)} upvotes). Sell: ${p['suggested_sell_price']:.2f} | Cost: ${p['cost_price']:.2f}. Score: {total}/130."
                     timeout = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
+                    
+                    # FIX: Read the actual port Railway assigned (defaults to 8080)
+                    port = os.getenv("PORT", "8080")
 
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         resp = await client.post(
-                            "http://localhost:8000/api/decisions",
+                            f"http://127.0.0.1:{port}/api/decisions",
                             json={
                                 "agent_name": "researcher",
                                 "decision_type": "product_approval",
