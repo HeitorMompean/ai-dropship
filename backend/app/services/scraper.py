@@ -189,6 +189,25 @@ class ScraperService:
 
     async def scrape_trending_products(self, limit=10):
         logger.info("[SCRAPER] Starting")
+        
+        # 🚨 FORCE TEST MODE: Bypasses scraper to test Telegram & Shopify 🚨
+        # DELETE THIS BLOCK LATER once ScrapingBee key is fixed!
+        logger.warning("[SCRAPER] Running in FORCE TEST MODE (Fake Data)")
+        return [
+            {
+                "title": "Portable Blender Pro",
+                "description": "Trending on r/gadgets (1500 upvotes).",
+                "supplier_url": "https://aliexpress.com/item/123",
+                "cost_price": 8.50,
+                "suggested_sell_price": 29.99,
+                "margin": 21.49,
+                "scores": {"Problem/Solution": 9, "Profit Margin": 9, "Trending": 9, "Impulse": 9},
+                "total_score": 95,
+                "source_data": {"reddit": {"subreddit": "r/gadgets", "upvotes": 1500}, "google_trends": {"interest_score": 85}}
+            }
+        ]
+        # 🚨 END FORCE TEST MODE 🚨
+
         posts = []
         for sub in SUBS:
             posts.extend(await self._rd(sub, 25))
