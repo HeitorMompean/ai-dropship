@@ -1,5 +1,5 @@
-"""Real product scraper - Reddit via ScrapingBee + AliExpress."""
-import logging, random, re, urllib.parse, os
+"""Real product scraper - Reddit via CORS Proxy + AliExpress."""
+import logging, random, re, urllib.parse
 from typing import Any, Dict, List
 import httpx
 
@@ -55,22 +55,18 @@ class ScraperService:
         return self._c
 
     async def _rd(self, sub, limit=25):
-        """Scrape Reddit via ScrapingBee proxy to bypass cloud IP blocks."""
+        """Scrape Reddit via free CORS proxy to bypass cloud IP blocks."""
         try:
-            scrapingbee_key = os.getenv("SCRAPINGBEE_API_KEY")
-            if not scrapingbee_key:
-                logger.error("[SCRAPER] SCRAPINGBEE_API_KEY not set - get free key at scrapingbee.com")
-                return []
-
+            # Use free public CORS proxy
             reddit_url = f"https://www.reddit.com/r/{sub}/.json?limit={limit}"
-            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(reddit_url)}&render_js=false&premium_proxy=true"
-
+            proxy_url = f"https://corsproxy.io/?{urllib.parse.quote(reddit_url)}"
+            
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(proxy_url, headers={"User-Agent": "Mozilla/5.0"})
                 response.raise_for_status()
                 data = response.json()
                 posts = data.get("data", {}).get("children", [])
-
+                
                 results = []
                 for p in posts:
                     post_data = p.get("data", {})
@@ -86,15 +82,9 @@ class ScraperService:
                             "permalink": f"https://reddit.com{post_data.get('permalink', '')}"
                         })
                 return results
-
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 403:
-                logger.error(f"[SCRAPER] ScrapingBee blocked on r/{sub} - check API key quota")
-            else:
-                logger.error(f"[SCRAPER] HTTP {e.response.status_code} on r/{sub}")
-            return []
+                
         except Exception as e:
-            logger.error(f"[SCRAPER] Error on r/{sub}: {type(e).__name__} - {e}")
+            logger.error(f"[SCRAPER] CORS proxy error on r/{sub}: {type(e).__name__} - {e}")
             return []
 
     def _clean(self, t):
@@ -189,30 +179,6 @@ class ScraperService:
 
     async def scrape_trending_products(self, limit=10):
         logger.info("[SCRAPER] Starting")
-        
-               # 🚨 FORCE TEST MODE: Bypasses scraper to test Telegram & Shopify 🚨
-        logger.warning("[SCRAPER] Running in FORCE TEST MODE (Fake Data)")
-        return [
-            {
-                "title": "Portable Blender Pro",
-                "description": "Trending on r/gadgets (1500 upvotes).",
-                "supplier_url": "https://aliexpress.com/item/123",
-                "cost_price": 8.50,
-                "suggested_sell_price": 29.99,
-                "margin": 21.49,
-                "scores": {
-                    "Problem/Solution": 9, "Passionate Audience": 9, "Profit Margin": 9,
-                    "Perceived Value": 9, "Impulse": 9, "Availability": 9,
-                    "Trending": 9, "Shipping": 9, "Legal/Safe": 9,
-                    "Repeat Purchase": 9, "Visual Appeal": 9, "Price Point": 9,
-                    "Competition": 9
-                },
-                "total_score": 117,
-                "source_data": {"reddit": {"subreddit": "r/gadgets", "upvotes": 1500}, "google_trends": {"interest_score": 85}}
-            }
-        ]
-        # 🚨 END FORCE TEST MODE 🚨
-
         posts = []
         for sub in SUBS:
             posts.extend(await self._rd(sub, 25))
