@@ -73,6 +73,7 @@ class AgentResearcher:
                     # FIX: Read the actual port Railway assigned (defaults to 8080)
                     port = os.getenv("PORT", "8080")
 
+                    port = os.getenv("PORT", "8080")
                     async with httpx.AsyncClient(timeout=30.0) as client:
                         resp = await client.post(
                             f"http://127.0.0.1:{port}/api/decisions",
