@@ -55,12 +55,16 @@ class ScraperService:
         return self._c
 
     async def _rd(self, sub, limit=25):
-        """Scrape Reddit via free CORS proxy to bypass cloud IP blocks."""
+        """Scrape Reddit via ScrapingBee proxy."""
         try:
-            # Use free public CORS proxy
+            scrapingbee_key = os.getenv("SCRAPINGBEE_API_KEY")
+            if not scrapingbee_key:
+                logger.error("[SCRAPER] SCRAPINGBEE_API_KEY not set")
+                return []
+
             reddit_url = f"https://www.reddit.com/r/{sub}/.json?limit={limit}"
-            proxy_url = f"https://corsproxy.io/?{urllib.parse.quote(reddit_url)}"
-            
+            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(reddit_url)}&render_js=false&premium_proxy=true"
+
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(proxy_url, headers={"User-Agent": "Mozilla/5.0"})
                 response.raise_for_status()
@@ -84,7 +88,7 @@ class ScraperService:
                 return results
                 
         except Exception as e:
-            logger.error(f"[SCRAPER] CORS proxy error on r/{sub}: {type(e).__name__} - {e}")
+            logger.error(f"[SCRAPER] Error on r/{sub}: {e}")
             return []
 
     def _clean(self, t):
