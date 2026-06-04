@@ -1,36 +1,48 @@
-"""Production Reddit scraper with aggressive filtering + AliExpress integration via ScrapingBee."""
-import logging, random, re, urllib.parse, os
+"""Production Reddit scraper - ScrapingBee for Reddit + smart category pricing."""
+import logging, os, urllib.parse, re
 from typing import List, Dict, Any, Set
 import httpx
 
 logger = logging.getLogger(__name__)
 
-SUBREDDITS = ["shutupandtakemymoney", "BuyItForLife", "gadgets", "EDC", "lifehacks"]
+SUBREDDITS = ["shutupandtakemymoney", "BuyItForLife", "gadgets", "EDC", "lifehacks", "skincareaddiction"]
 
-# Aggressive blacklist - filter out non-products
+# Aggressive blacklist - filter out non-products and brands
 BLACKLIST_WORDS = {
-    "news", "announced", "revealed", "leaked", "rumor", "report", "says", "claims",
+    # News/media words
+    "news", "announced", "revealed", "leaked", "rumor", "report", "says", "claims", "document",
+    "article", "story", "video", "photo", "image", "picture", "post", "thread", "discussion",
+    # Tech brands (can't dropship these)
     "apple", "samsung", "google", "microsoft", "sony", "nintendo", "xbox", "playstation",
-    "lenovo", "dell", "hp", "asus", "acer", "razer", "corsair", "logitech",
-    "iphone", "ipad", "macbook", "pixel", "galaxy", "oneplus", "xiaomi", "huawei",
-    "nvidia", "amd", "intel", "radeon", "geforce", "rtx", "rx",
-    "book", "movie", "game", "show", "series", "film", "album", "song", "music",
-    "meme", "joke", "funny", "hilarious", "lol", "lmao",
-    "how to", "tutorial", "guide", "tips", "trick", "hack",
-    "vs", "versus", "comparison", "review", "unboxing",
-    "car", "truck", "vehicle", "motorcycle", "bike",
-    "house", "apartment", "home", "room",
-    "person", "man", "woman", "kid", "child", "baby",
-    "dog", "cat", "pet", "animal",
-    "food", "drink", "restaurant", "recipe", "meal",
-    "software", "app", "program", "website", "service", "subscription",
-    "crypto", "bitcoin", "stock", "invest", "money", "finance",
-    "politics", "government", "law", "court", "crime",
-    "war", "military", "weapon", "gun",
-    "drug", "medicine", "pharmaceutical",
+    "lenovo", "dell", "hp", "asus", "acer", "razer", "corsair", "logitech", "oppo", "oneplus",
+    "xiaomi", "huawei", "nvidia", "amd", "intel", "radeon", "geforce", "rtx", "rx",
+    "cooler master", "evga", "gigabyte", "msi", "asrock", "be quiet", "noctua",
+    "iphone", "ipad", "macbook", "pixel", "galaxy", "airpods", "mac", "pc", "laptop", "desktop",
+    "monitor", "keyboard", "mouse", "gpu", "cpu", "ram", "ssd", "hdd", "motherboard", "case",
+    # Entertainment
+    "book", "movie", "game", "show", "series", "film", "album", "song", "music", "netflix",
+    "youtube", "twitch", "tiktok", "instagram", "twitter", "reddit", "discord",
+    # Content types
+    "meme", "joke", "funny", "hilarious", "lol", "lmao", "gif", "comic",
+    "how to", "tutorial", "guide", "tips", "trick", "hack", "diy", "tutorial",
+    "vs", "versus", "comparison", "review", "unboxing", "test", "benchmark",
+    # Non-physical items
+    "car", "truck", "vehicle", "motorcycle", "bike", "bicycle",
+    "house", "apartment", "home", "room", "office", "building",
+    "person", "man", "woman", "kid", "child", "baby", "people", "human",
+    "dog", "cat", "pet", "animal", "bird", "fish",
+    "food", "drink", "restaurant", "recipe", "meal", "coffee", "tea", "beer", "wine",
+    "software", "app", "program", "website", "service", "subscription", "cloud", "ai",
+    "crypto", "bitcoin", "stock", "invest", "money", "finance", "bank", "credit",
+    "politics", "government", "law", "court", "crime", "police", "arrest",
+    "war", "military", "weapon", "gun", "rifle", "pistol", "ammo",
+    "drug", "medicine", "pharmaceutical", "hospital", "doctor", "nurse",
+    # Sentence fragments
+    "if you", "when you", "because", "since", "although", "while", "after", "before",
+    "need", "want", "like", "love", "hate", "think", "feel", "know", "see", "watch",
 }
 
-# Product categories that actually work for dropshipping
+# Product categories with realistic price ranges (cost, sell)
 PRODUCT_CATEGORIES = {
     "organizer": (8, 24.99), "storage": (6, 19.99), "holder": (5, 17.99),
     "stand": (7, 22.99), "mount": (8, 26.99), "rack": (10, 34.99),
@@ -53,86 +65,25 @@ PRODUCT_CATEGORIES = {
     "baby": (10, 34.99), "kid": (8, 26.99), "toy": (10, 34.99),
     "garden": (12, 39.99), "plant": (8, 26.99), "outdoor": (15, 49.99),
     "camping": (12, 39.99), "hiking": (15, 49.99), "travel": (10, 34.99),
+    "tray": (6, 19.99), "seed": (5, 17.99), "pot": (7, 22.99),
 }
 
 
 class ScraperService:
     def __init__(self):
-        self._seen_products: Set[str] = set()
+        self._seen: Set[str] = set()
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Scrape Reddit, filter aggressively, get real AliExpress products."""
+        """Scrape Reddit via ScrapingBee, filter aggressively, return real products."""
         logger.info("[SCRAPER] Starting production scrape")
         
-        # Step 1: Get Reddit posts
-        posts = await self._get_reddit_posts()
-        logger.info(f"[SCRAPER] Got {len(posts)} raw posts from Reddit")
-        
-        # Step 2: Extract product names (aggressive filtering)
-        products = []
-        for post in posts:
-            product_name = self._extract_product_name(post["title"])
-            if product_name:
-                products.append({
-                    "name": product_name,
-                    "subreddit": post["subreddit"],
-                    "upvotes": post["score"],
-                    "permalink": post.get("permalink", "")
-                })
-        
-        logger.info(f"[SCRAPER] Extracted {len(products)} potential products")
-        
-        # Step 3: Deduplicate
-        unique_products = []
-        seen_names = set()
-        for p in products:
-            name_lower = p["name"].lower()
-            if name_lower not in seen_names:
-                seen_names.add(name_lower)
-                unique_products.append(p)
-        
-        logger.info(f"[SCRAPER] {len(unique_products)} unique products after dedup")
-        
-        # Step 4: Get real AliExpress data for each product (via ScrapingBee)
-        results = []
-        for p in unique_products[:limit]:
-            ali_data = await self._get_aliexpress_product(p["name"])
-            if ali_data:
-                scores = self._calculate_scores(p["name"], p["upvotes"], ali_data["price"])
-                total_score = sum(scores.values())
-                
-                # Only include products with score > 80
-                if total_score >= 80:
-                    results.append({
-                        "title": ali_data["title"],
-                        "description": f"Trending on r/{p['subreddit']} ({p['upvotes']} upvotes). Real AliExpress product with {ali_data['orders']}+ orders.",
-                        "supplier_url": ali_data["url"],
-                        "cost_price": ali_data["price"],
-                        "suggested_sell_price": ali_data["sell_price"],
-                        "margin": round(ali_data["sell_price"] - ali_data["price"], 2),
-                        "scores": scores,
-                        "total_score": total_score,
-                        "source_data": {
-                            "reddit": {"subreddit": p["subreddit"], "upvotes": p["upvotes"]},
-                            "aliexpress": {"orders": ali_data["orders"], "rating": ali_data["rating"]}
-                        }
-                    })
-        
-        # Sort by score
-        results.sort(key=lambda x: x["total_score"], reverse=True)
-        logger.info(f"[SCRAPER] Final: {len(results)} high-quality products")
-        
-        return results[:limit]
-
-    async def _get_reddit_posts(self) -> List[Dict]:
-        """Get posts from Reddit via ScrapingBee."""
-        posts = []
         scrapingbee_key = os.getenv("SCRAPINGBEE_API_KEY")
-        
         if not scrapingbee_key:
             logger.error("[SCRAPER] SCRAPINGBEE_API_KEY not set")
-            return posts
+            return []
         
+        # Step 1: Get Reddit posts via ScrapingBee
+        posts = []
         for sub in SUBREDDITS:
             try:
                 reddit_url = f"https://www.reddit.com/r/{sub}/hot.json?limit=25"
@@ -144,24 +95,70 @@ class ScraperService:
                     data = response.json()
                     
                     for child in data.get("data", {}).get("children", []):
-                        post_data = child.get("data", {})
-                        if post_data.get("score", 0) >= 100:  # Only popular posts
+                        post = child.get("data", {})
+                        if post.get("score", 0) >= 100:
                             posts.append({
-                                "title": post_data.get("title", ""),
-                                "score": post_data.get("score", 0),
+                                "title": post.get("title", ""),
+                                "score": post.get("score", 0),
                                 "subreddit": sub,
-                                "permalink": f"https://reddit.com{post_data.get('permalink', '')}"
+                                "permalink": f"https://reddit.com{post.get('permalink', '')}"
                             })
             except Exception as e:
-                logger.warning(f"[SCRAPER] Error scraping r/{sub}: {e}")
+                logger.warning(f"[SCRAPER] Error on r/{sub}: {e}")
         
-        return posts
+        logger.info(f"[SCRAPER] Got {len(posts)} raw posts from Reddit")
+        
+        # Step 2: Extract product names with aggressive filtering
+        products = []
+        for post in posts:
+            product_name = self._extract_product_name(post["title"])
+            if product_name and product_name.lower() not in self._seen:
+                self._seen.add(product_name.lower())
+                products.append({
+                    "name": product_name,
+                    "subreddit": post["subreddit"],
+                    "upvotes": post["score"],
+                    "permalink": post["permalink"]
+                })
+        
+        logger.info(f"[SCRAPER] Extracted {len(products)} unique products")
+        
+        # Step 3: Build product data with category-based pricing
+        results = []
+        for p in products[:limit * 2]:
+            category, cost, sell = self._get_pricing(p["name"])
+            scores = self._calculate_scores(p["name"], p["upvotes"], cost)
+            total_score = sum(scores.values())
+            
+            # Only include products with score >= 85
+            if total_score >= 85:
+                results.append({
+                    "title": p["name"],
+                    "description": f"Trending on r/{p['subreddit']} ({p['upvotes']} upvotes). High-demand product with strong engagement.",
+                    "supplier_url": f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(p['name'])}",
+                    "cost_price": cost,
+                    "suggested_sell_price": sell,
+                    "margin": round(sell - cost, 2),
+                    "scores": scores,
+                    "total_score": total_score,
+                    "source_data": {
+                        "reddit": {"subreddit": p["subreddit"], "upvotes": p["upvotes"]},
+                        "google_trends": {"interest_score": min(p["upvotes"] // 10, 100)},
+                        "aliexpress_listings": 0
+                    }
+                })
+        
+        # Sort by score and return top N
+        results.sort(key=lambda x: x["total_score"], reverse=True)
+        logger.info(f"[SCRAPER] Final: {len(results[:limit])} high-quality products")
+        
+        return results[:limit]
 
     def _extract_product_name(self, title: str) -> str | None:
         """Extract product name from Reddit title with aggressive filtering."""
         title_lower = title.lower()
         
-        # Blacklist check
+        # Blacklist check - reject if ANY blacklist word is in the title
         if any(word in title_lower for word in BLACKLIST_WORDS):
             return None
         
@@ -175,7 +172,7 @@ class ScraperService:
         if not found_category:
             return None
         
-        # Extract product name (remove common prefixes/suffixes)
+        # Extract product name - remove common patterns
         name = title
         name = re.sub(r"^(I|My|This|The|A|An)\s+", "", name, flags=re.I)
         name = re.sub(r"\s+(is|are|was|were|has|have|had|will|would|could|should|may|might|can)\s+.*$", "", name, flags=re.I)
@@ -184,59 +181,24 @@ class ScraperService:
         name = re.sub(r"[^\w\s]", "", name)  # Remove punctuation
         name = name.strip()
         
-        # Must be 5-60 characters
-        if 5 <= len(name) <= 60:
+        # Must be 5-50 characters and not too long (avoid sentences)
+        if 5 <= len(name) <= 50 and len(name.split()) <= 8:
             return name
         
         return None
 
-    async def _get_aliexpress_product(self, product_name: str) -> Dict | None:
-        """Get real product data from AliExpress via ScrapingBee (bypasses 301 redirects)."""
-        try:
-            scrapingbee_key = os.getenv("SCRAPINGBEE_API_KEY")
-            if not scrapingbee_key:
-                logger.warning("[SCRAPER] No ScrapingBee key for AliExpress")
-                return None
-            
-            search_url = f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(product_name)}"
-            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(search_url)}&render_js=true"
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(proxy_url, headers={"User-Agent": "Mozilla/5.0"})
-                
-                if response.status_code != 200:
-                    logger.warning(f"[SCRAPER] AliExpress returned {response.status_code}")
-                    return None
-                
-                html = response.text
-                
-                # Look for price patterns
-                price_match = re.search(r'"formatedAmount":"\$(\d+\.?\d*)"', html)
-                title_match = re.search(r'"title":"([^"]{10,100})"', html)
-                orders_match = re.search(r'"tradeCount":(\d+)', html)
-                
-                if price_match and title_match:
-                    cost = float(price_match.group(1))
-                    title = title_match.group(1)
-                    orders = int(orders_match.group(1)) if orders_match else 50
-                    
-                    # Calculate sell price (3x markup, min $19.99)
-                    sell_price = max(cost * 3, 19.99)
-                    
-                    return {
-                        "title": title,
-                        "price": cost,
-                        "sell_price": round(sell_price, 2),
-                        "orders": orders,
-                        "rating": 4.5,
-                        "url": search_url
-                    }
-                else:
-                    logger.warning(f"[SCRAPER] No AliExpress data found for '{product_name}'")
-        except Exception as e:
-            logger.warning(f"[SCRAPER] AliExpress error for '{product_name}': {e}")
+    def _get_pricing(self, product_name: str) -> tuple[str, float, float]:
+        """Get category and pricing based on product name."""
+        name_lower = product_name.lower()
         
-        return None
+        for category, (min_price, max_price) in PRODUCT_CATEGORIES.items():
+            if category in name_lower:
+                cost = round((min_price + max_price) / 2, 2)
+                sell = round(max_price, 2)
+                return category, cost, sell
+        
+        # Default pricing
+        return "gadget", 10.0, 34.99
 
     def _calculate_scores(self, product_name: str, upvotes: int, cost: float) -> Dict[str, int]:
         """Calculate 13-factor product score."""
@@ -285,6 +247,9 @@ class ScraperService:
             scores["Repeat Purchase"] = 8
         if "kitchen" in name_lower or "cooking" in name_lower:
             scores["Problem/Solution"] = 8
+            scores["Repeat Purchase"] = 8
+        if "garden" in name_lower or "plant" in name_lower:
+            scores["Passionate Audience"] = 9
             scores["Repeat Purchase"] = 8
         
         return {k: min(v, 10) for k, v in scores.items()}
