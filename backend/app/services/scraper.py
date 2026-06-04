@@ -243,50 +243,69 @@ class ScraperService:
         return None
 
     async def _get_aliexpress_data(self, product_name: str, scrapingbee_key: str) -> Dict | None:
-        """Get real AliExpress product data via ScrapingBee."""
+        """Get REAL AliExpress prices by extracting hidden JSON data (bypasses fake HTML prices)."""
         try:
             search_url = f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(product_name)}"
-            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(search_url)}&render_js=true"
+            # render_js=true forces AliExpress to load the real JSON pricing data
+            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(search_url)}&render_js=true&block_ads=true"
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=45.0) as client:
                 response = await client.get(proxy_url, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9"
                 })
                 
                 if response.status_code != 200:
-                    logger.warning(f"[SCRAPER] AliExpress returned {response.status_code}")
                     return None
                 
                 html = response.text
-                
-                # Extract price (multiple patterns)
                 price = None
-                price_patterns = [
-                    r'"formatedAmount":"US \$(\d+\.?\d*)"',
-                    r'"minAmount":\{"value":(\d+\.?\d*)',
-                    r'"price":"(\d+\.?\d*)"',
-                    r'\$(\d+\.\d{2})'
-                ]
                 
-                for pattern in price_patterns:
-                    match = re.search(pattern, html)
-                    if match:
-                        price = float(match.group(1))
-                        if price > 0:
-                            break
+                # 🎯 REAL PRICE EXTRACTION: Look for the hidden JSON pricing objects
+                # Pattern 1: minPrice (Most accurate for dropshipping wholesale cost)
+                min_price_match = re.search(r'"minPrice"\s*:\s*(\d+\.\d{2})', html)
+                if min_price_match:
+                    price = float(min_price_match.group(1))
                 
+                # Pattern 2: minAmount value (Fallback JSON structure)
                 if not price:
-                    logger.warning(f"[SCRAPER] No price found for '{product_name}'")
+                    amt_match = re.search(r'"minAmount"[^}]*?"value"\s*:\s*(\d+\.?\d*)', html)
+                    if amt_match:
+                        price = float(amt_match.group(1))
+                        
+                # Pattern 3: salePrice minPrice
+                if not price:
+                    sale_match = re.search(r'"salePrice"[^}]*?"minPrice"\s*:\s*(\d+\.\d{2})', html)
+                    if sale_match:
+                        price = float(sale_match.group(1))
+
+                # Pattern 4: formatedAmount (US $12.34)
+                if not price:
+                    fmt_match = re.search(r'"formatedAmount"\s*:\s*"[^0-9]*?\$(\d+\.\d{2})"', html)
+                    if fmt_match:
+                        price = float(fmt_match.group(1))
+
+                if not price or price < 1.0:
+                    logger.warning(f"[SCRAPER] No REAL price found in JSON for '{product_name}'")
                     return None
                 
-                # Extract product count
-                count_match = re.search(r'"totalCount":(\d+)', html)
+                # Extract real order count (social proof)
+                count_match = re.search(r'"tradeCount"\s*:\s*"?(\d+)"?', html)
+                if not count_match:
+                    count_match = re.search(r'"orders"\s*:\s*(\d+)', html)
                 count = int(count_match.group(1)) if count_match else 0
                 
-                # Calculate sell price (2.5-3x markup, min $19.99)
-                markup = 2.8 if price < 15 else 2.5
-                sell_price = max(round(price * markup, 2), 19.99)
+                # 💰 PROFESSIONAL DROPSHIPPING PRICING STRATEGY
+                # Standard dropshipping markup is 2.5x to 3x + shipping buffer
+                markup = 3.0 if price < 10 else 2.5
+                sell_price = round((price * markup) + 2.50, 2) # +$2.50 shipping buffer
                 
+                # Ensure minimum viable psychological price points
+                if sell_price < 19.99:
+                    sell_price = 19.99
+                elif sell_price > 25.00 and sell_price < 29.99:
+                    sell_price = 29.99
+                    
                 return {
                     "price": price,
                     "sell_price": sell_price,
@@ -296,10 +315,9 @@ class ScraperService:
                 }
                 
         except Exception as e:
-            logger.warning(f"[SCRAPER] AliExpress error for '{product_name}': {e}")
+            logger.warning(f"[SCRAPER] AliExpress JSON extraction error for '{product_name}': {e}")
         
         return None
-
     def _calculate_scores(self, product_name: str, upvotes: int, cost: float) -> Dict[str, int]:
         """Calculate 13-factor product score."""
         scores = {
