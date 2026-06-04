@@ -1,4 +1,4 @@
-"""Production Reddit scraper with aggressive filtering + AliExpress integration."""
+"""Production Reddit scraper with aggressive filtering + AliExpress integration via ScrapingBee."""
 import logging, random, re, urllib.parse, os
 from typing import List, Dict, Any, Set
 import httpx
@@ -93,7 +93,7 @@ class ScraperService:
         
         logger.info(f"[SCRAPER] {len(unique_products)} unique products after dedup")
         
-        # Step 4: Get real AliExpress data for each product
+        # Step 4: Get real AliExpress data for each product (via ScrapingBee)
         results = []
         for p in unique_products[:limit]:
             ali_data = await self._get_aliexpress_product(p["name"])
@@ -191,19 +191,23 @@ class ScraperService:
         return None
 
     async def _get_aliexpress_product(self, product_name: str) -> Dict | None:
-        """Get real product data from AliExpress."""
+        """Get real product data from AliExpress via ScrapingBee (bypasses 301 redirects)."""
         try:
-            search_url = f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(product_name)}"
+            scrapingbee_key = os.getenv("SCRAPINGBEE_API_KEY")
+            if not scrapingbee_key:
+                logger.warning("[SCRAPER] No ScrapingBee key for AliExpress")
+                return None
             
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.get(search_url, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                })
+            search_url = f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(product_name)}"
+            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(search_url)}&render_js=true"
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(proxy_url, headers={"User-Agent": "Mozilla/5.0"})
                 
                 if response.status_code != 200:
+                    logger.warning(f"[SCRAPER] AliExpress returned {response.status_code}")
                     return None
                 
-                # Extract product data from HTML (simplified - in production use proper scraping)
                 html = response.text
                 
                 # Look for price patterns
@@ -224,9 +228,11 @@ class ScraperService:
                         "price": cost,
                         "sell_price": round(sell_price, 2),
                         "orders": orders,
-                        "rating": 4.5,  # Default rating
+                        "rating": 4.5,
                         "url": search_url
                     }
+                else:
+                    logger.warning(f"[SCRAPER] No AliExpress data found for '{product_name}'")
         except Exception as e:
             logger.warning(f"[SCRAPER] AliExpress error for '{product_name}': {e}")
         
