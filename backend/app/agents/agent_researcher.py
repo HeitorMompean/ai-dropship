@@ -23,8 +23,7 @@ class AgentResearcher:
 
     def __init__(self):
         self.agent = self._build_agent()
-    def __init__(self):
-        self.agent = self._build_agent()
+        self._sent_notifications: Set[str] = set()
 
     def _build_tools(self):
         tools = [
