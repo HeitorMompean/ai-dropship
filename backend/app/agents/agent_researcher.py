@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 class AgentResearcher:
+    _sent_notifications: Set[str] = set()
+    
+    def __init__(self):
+        self.agent = self._build_agent()
     def __init__(self):
         self.agent = self._build_agent()
 
