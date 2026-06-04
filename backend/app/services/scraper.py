@@ -1,21 +1,21 @@
-"""Production-grade Reddit scraper with intelligent product extraction and real AliExpress pricing."""
-import logging, os, urllib.parse, re
-from typing import List, Dict, Any, Set
+"""Production scraper with REAL AliExpress prices via ScrapingBee."""
+import logging, os, urllib.parse, re, time
+from typing import List, Dict, Any, Set, Optional
 import httpx
 
 logger = logging.getLogger(__name__)
 
 SUBREDDITS = ["shutupandtakemymoney", "BuyItForLife", "gadgets", "EDC", "lifehacks", "skincareaddiction"]
 
-# Brands to filter out (can't dropship these)
+# Brands to filter out
 BRAND_BLACKLIST = {
     "apple", "samsung", "google", "microsoft", "sony", "nintendo", "xbox", "playstation",
     "lenovo", "dell", "hp", "asus", "acer", "razer", "corsair", "logitech", "oppo",
     "xiaomi", "huawei", "nvidia", "amd", "intel", "radeon", "geforce",
     "cooler master", "evga", "gigabyte", "msi", "be quiet", "noctua",
-    "sennheiser", "bose", "sony", "jbl", "beats", "airpods", "macbook",
+    "sennheiser", "bose", "jbl", "beats", "airpods", "macbook",
     "iphone", "ipad", "pixel", "galaxy", "oneplus", "dell xps", "macbook pro",
-    "predator", "arduboy", "gopro", "xgimi", "lenovo yoga"
+    "predator", "arduboy", "gopro", "xgimi", "lenovo yoga", "zen", "ryzen"
 }
 
 # Non-product content patterns
@@ -31,65 +31,34 @@ CONTENT_BLACKLIST = [
     r"\b(list of|a list|things made|not made in|from canada|from usa)\b",
 ]
 
-# Product categories with realistic AliExpress price ranges (cost, sell)
+# Product categories with fallback pricing (cost, sell)
 PRODUCT_CATEGORIES = {
-    # Storage & Organization
     "organizer": (6, 22), "storage": (5, 18), "holder": (4, 15), "stand": (6, 20),
     "mount": (7, 24), "rack": (9, 32), "shelf": (8, 28), "drawer": (7, 25),
-    
-    # Electronics & Accessories
     "charger": (8, 28), "cable": (3, 12), "adapter": (5, 18), "hub": (8, 28),
     "power bank": (10, 35), "battery": (6, 22),
-    
-    # Lighting
     "light": (7, 25), "lamp": (9, 30), "led": (5, 20), "lantern": (8, 28),
-    
-    # Audio
     "speaker": (11, 38), "headphone": (13, 48), "earbud": (9, 32), "microphone": (10, 35),
-    
-    # Wearables
     "watch": (11, 38), "tracker": (13, 42), "band": (6, 22),
-    
-    # Security
     "camera": (16, 52), "lock": (11, 38), "sensor": (7, 25), "alarm": (9, 32),
-    
-    # Home & Cleaning
     "cleaner": (9, 32), "purifier": (13, 48), "humidifier": (11, 38),
     "vacuum": (15, 50), "robot": (18, 58),
-    
-    # Comfort
     "massager": (13, 48), "pillow": (9, 32), "blanket": (11, 38),
     "mattress": (15, 50), "cushion": (8, 28),
-    
-    # Bags & Cases
     "bag": (11, 38), "backpack": (13, 48), "wallet": (7, 25),
     "case": (5, 18), "cover": (4, 15), "protector": (3, 13),
-    
-    # Tools
     "tool": (9, 32), "kit": (11, 38), "set": (13, 42), "wrench": (7, 25),
-    
-    # Gadgets
     "gadget": (7, 25), "device": (9, 32), "accessory": (5, 18),
-    
-    # Kitchen
     "kitchen": (9, 32), "blender": (13, 48), "cutter": (7, 25),
     "bottle": (5, 18), "cup": (4, 15), "mug": (5, 18), "thermos": (8, 28),
-    
-    # Fitness
     "fitness": (11, 38), "exercise": (13, 48), "yoga": (9, 32),
     "posture": (11, 38), "corrector": (9, 32), "brace": (7, 25),
-    "band": (6, 22), "mat": (8, 28),
-    
-    # Pets
     "pet": (7, 25), "dog": (9, 32), "cat": (7, 25), "toy": (9, 32),
-    
-    # Garden & Outdoor
     "garden": (11, 38), "plant": (7, 25), "outdoor": (13, 48),
     "camping": (11, 38), "hiking": (13, 48), "travel": (9, 32),
     "tray": (5, 18), "seed": (4, 15), "pot": (6, 22),
 }
 
-# Patterns to extract product names from Reddit titles
 EXTRACTION_PATTERNS = [
     r"(?:I|we)\s+(?:bought|got|found|purchased)\s+(?:this|a|an|the)?\s*([^.!?]{5,60})",
     r"(?:this|my|the)\s+([^.!?]{5,60})\s+(?:is|are|was|changed|saved|helped|works|rocks)",
@@ -105,19 +74,19 @@ class ScraperService:
         self._seen_products: Set[str] = set()
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Production scrape with intelligent filtering and real AliExpress prices."""
-        logger.info("[SCRAPER] Starting production scrape")
+        """Production scrape with REAL AliExpress prices."""
+        logger.info("[SCRAPER] Starting production scrape with REAL prices")
         
         scrapingbee_key = os.getenv("SCRAPINGBEE_API_KEY")
         if not scrapingbee_key:
             logger.error("[SCRAPER] SCRAPINGBEE_API_KEY not set")
             return []
         
-        # Step 1: Get Reddit posts via ScrapingBee
+        # Step 1: Get Reddit posts
         posts = await self._get_reddit_posts(scrapingbee_key)
         logger.info(f"[SCRAPER] Got {len(posts)} posts from Reddit")
         
-        # Step 2: Extract product names intelligently
+        # Step 2: Extract product names
         products = []
         for post in posts:
             product_name = self._extract_product_name(post["title"])
@@ -134,38 +103,49 @@ class ScraperService:
         
         logger.info(f"[SCRAPER] Extracted {len(products)} unique products")
         
-        # Step 3: Get real AliExpress prices for top products
+        # Step 3: Get REAL AliExpress prices
         results = []
-        for p in products[:limit * 3]:  # Try more products to ensure we get enough
+        for p in products[:limit * 3]:
             ali_data = await self._get_aliexpress_data(p["name"], scrapingbee_key)
             
+            # Use REAL price if available, fallback to category pricing with WARNING
             if ali_data and ali_data.get("price"):
-                scores = self._calculate_scores(p["name"], p["upvotes"], ali_data["price"])
-                total_score = sum(scores.values())
-                
-                # Only include high-quality products
-                if total_score >= 85:
-                    results.append({
-                        "title": p["name"],
-                        "description": f"Trending on r/{p['subreddit']} ({p['upvotes']} upvotes). Real AliExpress product with {ali_data.get('orders', 0)}+ orders.",
-                        "supplier_url": ali_data["url"],
-                        "cost_price": ali_data["price"],
-                        "suggested_sell_price": ali_data["sell_price"],
-                        "margin": round(ali_data["sell_price"] - ali_data["price"], 2),
-                        "scores": scores,
-                        "total_score": total_score,
-                        "source_data": {
-                            "reddit": {"subreddit": p["subreddit"], "upvotes": p["upvotes"]},
-                            "google_trends": {"interest_score": min(p["upvotes"] // 10, 100)},
-                            "aliexpress_listings": ali_data.get("count", 0)
-                        }
-                    })
+                cost = ali_data["price"]
+                sell_price = ali_data["sell_price"]
+                logger.info(f"[SCRAPER] REAL price for '{p['name']}': ${cost:.2f} -> ${sell_price:.2f}")
+            else:
+                # Fallback to category pricing (but log WARNING)
+                category, fallback_cost, fallback_sell = self._get_category_pricing(p["name"])
+                cost = fallback_cost
+                sell_price = fallback_sell
+                logger.warning(f"[SCRAPER] FALLBACK price for '{p['name']}': ${cost:.2f} -> ${sell_price:.2f} (AliExpress scrape failed)")
+            
+            scores = self._calculate_scores(p["name"], p["upvotes"], cost)
+            total_score = sum(scores.values())
+            
+            if total_score >= 85:
+                results.append({
+                    "title": p["name"],
+                    "description": f"Trending on r/{p['subreddit']} ({p['upvotes']} upvotes).",
+                    "supplier_url": f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(p['name'])}",
+                    "cost_price": cost,
+                    "suggested_sell_price": sell_price,
+                    "margin": round(sell_price - cost, 2),
+                    "scores": scores,
+                    "total_score": total_score,
+                    "source_data": {
+                        "reddit": {"subreddit": p["subreddit"], "upvotes": p["upvotes"]},
+                        "google_trends": {"interest_score": min(p["upvotes"] // 10, 100)},
+                        "aliexpress_listings": ali_data.get("count", 0) if ali_data else 0,
+                        "price_source": "real" if ali_data and ali_data.get("price") else "fallback"
+                    }
+                })
             
             if len(results) >= limit:
                 break
         
         results.sort(key=lambda x: x["total_score"], reverse=True)
-        logger.info(f"[SCRAPER] Final: {len(results)} professional products with real prices")
+        logger.info(f"[SCRAPER] Final: {len(results)} products")
         
         return results[:limit]
 
@@ -197,8 +177,8 @@ class ScraperService:
         
         return posts
 
-    def _extract_product_name(self, title: str) -> str | None:
-        """Extract actual product name from Reddit title using intelligent patterns."""
+    def _extract_product_name(self, title: str) -> Optional[str]:
+        """Extract actual product name from Reddit title."""
         title_lower = title.lower()
         
         # Check brand blacklist
@@ -225,15 +205,13 @@ class ScraperService:
             match = re.search(pattern, title, re.I)
             if match:
                 name = match.group(1).strip()
-                # Clean up the name
                 name = re.sub(r"[^\w\s]", "", name)
                 name = re.sub(r"\s+", " ", name).strip()
                 
-                # Validate: 5-50 chars, 2-6 words
                 if 5 <= len(name) <= 50 and 2 <= len(name.split()) <= 6:
                     return name
         
-        # Fallback: use title directly if it's short enough
+        # Fallback: use title directly if short enough
         name = re.sub(r"[^\w\s]", "", title)
         name = re.sub(r"\s+", " ", name).strip()
         
@@ -242,70 +220,84 @@ class ScraperService:
         
         return None
 
-    async def _get_aliexpress_data(self, product_name: str, scrapingbee_key: str) -> Dict | None:
-        """Get REAL AliExpress prices by extracting hidden JSON data (bypasses fake HTML prices)."""
+    async def _get_aliexpress_data(self, product_name: str, scrapingbee_key: str) -> Optional[Dict]:
+        """Get REAL AliExpress product data via ScrapingBee with robust price extraction."""
         try:
             search_url = f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(product_name)}"
-            # render_js=true forces AliExpress to load the real JSON pricing data
-            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(search_url)}&render_js=true&block_ads=true"
+            # Use render_js=true to load dynamic content
+            proxy_url = f"https://app.scrapingbee.com/api/v1/?api_key={scrapingbee_key}&url={urllib.parse.quote(search_url)}&render_js=true&device=desktop"
             
             async with httpx.AsyncClient(timeout=45.0) as client:
                 response = await client.get(proxy_url, headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Accept-Language": "en-US,en;q=0.9"
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
                 })
                 
                 if response.status_code != 200:
+                    logger.warning(f"[SCRAPER] AliExpress returned {response.status_code} for '{product_name}'")
                     return None
                 
                 html = response.text
+                
+                # Try MULTIPLE price patterns (AliExpress changes their HTML frequently)
                 price = None
+                price_patterns = [
+                    # Pattern 1: formatedAmount with US $
+                    r'"formatedAmount":"US \$(\d+\.?\d*)"',
+                    # Pattern 2: formatedAmount with just $
+                    r'"formatedAmount":"\$(\d+\.?\d*)"',
+                    # Pattern 3: minAmount value
+                    r'"minAmount":\{"value":(\d+\.?\d*)',
+                    # Pattern 4: price field
+                    r'"price":"(\d+\.?\d*)"',
+                    # Pattern 5: raw price with $
+                    r'\$([0-9]+\.?[0-9]{0,2})(?!\d)',
+                    # Pattern 6: data-price attribute
+                    r'data-price="(\d+\.?\d*)"',
+                    # Pattern 7: salePrice
+                    r'"salePrice":\{"minAmount":\{"value":(\d+\.?\d*)',
+                ]
                 
-                # 🎯 REAL PRICE EXTRACTION: Look for the hidden JSON pricing objects
-                # Pattern 1: minPrice (Most accurate for dropshipping wholesale cost)
-                min_price_match = re.search(r'"minPrice"\s*:\s*(\d+\.\d{2})', html)
-                if min_price_match:
-                    price = float(min_price_match.group(1))
+                for pattern in price_patterns:
+                    match = re.search(pattern, html)
+                    if match:
+                        try:
+                            price = float(match.group(1))
+                            if 0.5 <= price <= 500:  # Reasonable price range
+                                break
+                        except ValueError:
+                            continue
                 
-                # Pattern 2: minAmount value (Fallback JSON structure)
                 if not price:
-                    amt_match = re.search(r'"minAmount"[^}]*?"value"\s*:\s*(\d+\.?\d*)', html)
-                    if amt_match:
-                        price = float(amt_match.group(1))
-                        
-                # Pattern 3: salePrice minPrice
-                if not price:
-                    sale_match = re.search(r'"salePrice"[^}]*?"minPrice"\s*:\s*(\d+\.\d{2})', html)
-                    if sale_match:
-                        price = float(sale_match.group(1))
-
-                # Pattern 4: formatedAmount (US $12.34)
-                if not price:
-                    fmt_match = re.search(r'"formatedAmount"\s*:\s*"[^0-9]*?\$(\d+\.\d{2})"', html)
-                    if fmt_match:
-                        price = float(fmt_match.group(1))
-
-                if not price or price < 1.0:
-                    logger.warning(f"[SCRAPER] No REAL price found in JSON for '{product_name}'")
+                    logger.warning(f"[SCRAPER] No valid price found for '{product_name}' in AliExpress HTML")
                     return None
                 
-                # Extract real order count (social proof)
-                count_match = re.search(r'"tradeCount"\s*:\s*"?(\d+)"?', html)
-                if not count_match:
-                    count_match = re.search(r'"orders"\s*:\s*(\d+)', html)
-                count = int(count_match.group(1)) if count_match else 0
+                # Extract product count/listings
+                count = 0
+                count_patterns = [
+                    r'"totalCount":(\d+)',
+                    r'"totalResults":(\d+)',
+                    r'(\d+)\s+orders',
+                ]
+                for pattern in count_patterns:
+                    match = re.search(pattern, html)
+                    if match:
+                        count = int(match.group(1))
+                        break
                 
-                # 💰 PROFESSIONAL DROPSHIPPING PRICING STRATEGY
-                # Standard dropshipping markup is 2.5x to 3x + shipping buffer
-                markup = 3.0 if price < 10 else 2.5
-                sell_price = round((price * markup) + 2.50, 2) # +$2.50 shipping buffer
+                # Calculate sell price: 2.5-3x markup based on cost
+                if price < 10:
+                    markup = 3.0
+                elif price < 25:
+                    markup = 2.8
+                else:
+                    markup = 2.5
                 
-                # Ensure minimum viable psychological price points
-                if sell_price < 19.99:
-                    sell_price = 19.99
-                elif sell_price > 25.00 and sell_price < 29.99:
-                    sell_price = 29.99
-                    
+                sell_price = round(max(price * markup, 19.99), 2)
+                
+                logger.info(f"[SCRAPER] Extracted REAL price for '{product_name}': ${price:.2f} -> ${sell_price:.2f} ({count} listings)")
+                
                 return {
                     "price": price,
                     "sell_price": sell_price,
@@ -314,10 +306,26 @@ class ScraperService:
                     "url": search_url
                 }
                 
+        except httpx.TimeoutException:
+            logger.warning(f"[SCRAPER] Timeout scraping AliExpress for '{product_name}'")
         except Exception as e:
-            logger.warning(f"[SCRAPER] AliExpress JSON extraction error for '{product_name}': {e}")
+            logger.warning(f"[SCRAPER] Error scraping AliExpress for '{product_name}': {type(e).__name__}: {e}")
         
         return None
+
+    def _get_category_pricing(self, product_name: str) -> tuple[str, float, float]:
+        """Get fallback pricing based on product category."""
+        name_lower = product_name.lower()
+        
+        for category, (min_price, max_price) in PRODUCT_CATEGORIES.items():
+            if category in name_lower:
+                cost = round((min_price + max_price) / 2, 2)
+                sell = round(max_price, 2)
+                return category, cost, sell
+        
+        # Default fallback
+        return "gadget", 8.0, 29.99
+
     def _calculate_scores(self, product_name: str, upvotes: int, cost: float) -> Dict[str, int]:
         """Calculate 13-factor product score."""
         scores = {
@@ -328,7 +336,7 @@ class ScraperService:
             "Competition": 6
         }
         
-        # Upvotes boost trending and audience scores
+        # Upvotes boost
         if upvotes > 1000:
             scores["Trending"] = 10
             scores["Passionate Audience"] = 9
@@ -344,11 +352,10 @@ class ScraperService:
             scores["Impulse"] = 9
         elif cost < 8:
             scores["Price Point"] = 8
-            scores["Impulse"] = 8
         else:
             scores["Price Point"] = 6
         
-        # Category-specific boosts
+        # Category boosts
         name_lower = product_name.lower()
         if any(word in name_lower for word in ["pet", "dog", "cat"]):
             scores["Passionate Audience"] = 10
