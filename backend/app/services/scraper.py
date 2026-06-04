@@ -1,4 +1,4 @@
-"""Simple working scraper - just returns products."""
+"""Simple scraper - returns products with minimal filtering."""
 import logging, os, urllib.parse, re
 from typing import List, Dict, Any
 import httpx
@@ -7,24 +7,10 @@ logger = logging.getLogger(__name__)
 
 SUBREDDITS = ["shutupandtakemymoney", "BuyItForLife", "gadgets", "EDC", "lifehacks"]
 
-# Minimal blacklist - only obvious non-products
-BLACKLIST = {
-    "news", "announced", "revealed", "leaked", "rumor", "report",
-    "apple", "samsung", "google", "microsoft", "sony", "nintendo",
-    "lenovo", "dell", "hp", "asus", "nvidia", "amd", "intel",
-    "iphone", "ipad", "macbook", "pixel", "galaxy",
-    "book", "movie", "game", "show", "series", "film", "album", "song",
-    "meme", "joke", "funny", "hilarious",
-    "car", "truck", "vehicle", "motorcycle", "bike",
-    "house", "apartment", "home", "room",
-    "dog", "cat", "pet", "animal",
-    "food", "drink", "restaurant", "recipe",
-    "crypto", "bitcoin", "stock", "invest",
-    "politics", "government", "law", "court", "crime",
-    "war", "military", "weapon", "gun",
-}
+# Only filter out OBVIOUS non-products
+BLACKLIST = {"news", "announced", "revealed", "leaked", "rumor", "report", "meme", "joke", "funny"}
 
-# Product categories with pricing
+# Product categories with pricing (cost, sell)
 CATEGORIES = {
     "organizer": (8, 24.99), "storage": (6, 19.99), "holder": (5, 17.99),
     "stand": (7, 22.99), "mount": (8, 26.99), "rack": (10, 34.99),
@@ -84,7 +70,7 @@ class ScraperService:
         
         logger.info(f"[SCRAPER] Got {len(posts)} posts")
         
-        # Extract products (permissive filtering)
+        # Extract products (VERY permissive)
         products = []
         seen = set()
         
@@ -96,22 +82,12 @@ class ScraperService:
             if any(word in title_lower for word in BLACKLIST):
                 continue
             
-            # Must have at least one category word
-            found_cat = None
-            for cat in CATEGORIES.keys():
-                if cat in title_lower:
-                    found_cat = cat
-                    break
-            
-            if not found_cat:
-                continue
-            
-            # Extract product name (simple cleanup)
+            # Clean up title
             name = re.sub(r"[^\w\s]", "", title)
             name = re.sub(r"\s+", " ", name).strip()
             
             # Skip if too long or too short
-            if len(name) < 5 or len(name) > 60:
+            if len(name) < 5 or len(name) > 80:
                 continue
             
             # Skip duplicates
@@ -119,7 +95,13 @@ class ScraperService:
                 continue
             seen.add(name.lower())
             
-            # Get pricing
+            # Find category (or use default)
+            found_cat = "gadget"
+            for cat in CATEGORIES.keys():
+                if cat in title_lower:
+                    found_cat = cat
+                    break
+            
             cost, sell = CATEGORIES[found_cat]
             
             # Calculate score
@@ -156,6 +138,10 @@ class ScraperService:
                     "google_trends": {"interest_score": 70}
                 }
             })
+            
+            # Stop if we have enough
+            if len(products) >= limit * 2:
+                break
         
         # Sort by score and return
         products.sort(key=lambda x: x["total_score"], reverse=True)
