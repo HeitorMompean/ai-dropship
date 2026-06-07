@@ -1,4 +1,4 @@
-"""Ultimate Production Scraper - Permissive Extraction + RapidAPI Debugging."""
+"""Ultimate Production Scraper - Smart Search Queries + Fixed RapidAPI Parsing."""
 import logging, os, urllib.parse, re
 from typing import List, Dict, Any, Set
 import httpx
@@ -13,7 +13,8 @@ BRAND_BLACKLIST = {
     "lenovo", "dell", "hp", "asus", "acer", "razer", "corsair", "logitech", "oppo",
     "xiaomi", "huawei", "nvidia", "amd", "intel", "radeon", "geforce",
     "sennheiser", "bose", "jbl", "beats", "airpods", "macbook", "iphone", "ipad",
-    "pixel", "galaxy", "oneplus", "dell xps", "macbook pro", "predator", "arduboy", "gopro"
+    "pixel", "galaxy", "oneplus", "dell xps", "macbook pro", "predator", "arduboy", "gopro",
+    "speed queen", "casio"
 }
 
 CONTENT_BLACKLIST = [
@@ -26,6 +27,7 @@ CONTENT_BLACKLIST = [
     r"\b(crypto|bitcoin|stock|invest|money|finance|bank)\b",
     r"\b(politics|government|law|court|crime|war|military|weapon|gun)\b",
     r"\b(list of|a list|things made|not made in|from canada|from usa|submission)\b",
+    r"\b(jewish|space|laser|activation|panel)\b",
 ]
 
 class ScraperService:
@@ -56,9 +58,7 @@ class ScraperService:
         logger.info(f"[SCRAPER] Extracted {len(products)} clean, unique products to test")
         
         results = []
-        # Test up to 10 products against RapidAPI
-        for p in products[:10]:
-            logger.info(f"[SCRAPER] Testing product: '{p['name']}'")
+        for p in products[:15]:
             ali_data = await self._get_real_aliexpress_data(p["name"], rapidapi_key)
             
             if ali_data and ali_data.get("price"):
@@ -81,7 +81,6 @@ class ScraperService:
                             "aliexpress_listings": ali_data.get("orders", 0)
                         }
                     })
-                    logger.info(f"[SCRAPER] SUCCESS: '{p['name']}' -> Cost: ${ali_data['price']}")
             
             if len(results) >= limit:
                 break
@@ -128,15 +127,33 @@ class ScraperService:
         if 5 <= len(name) <= 60: return name
         return None
 
+    def _get_search_query(self, name: str) -> str:
+        """Extract core keywords for AliExpress search by removing stop words and brands."""
+        STOP_WORDS = {
+            "the", "a", "an", "my", "your", "our", "this", "that", "is", "are", "was", "were", 
+            "for", "on", "with", "at", "by", "from", "as", "and", "or", "but", "if", "then", 
+            "than", "too", "very", "just", "still", "works", "perfectly", "probably", "wanted", 
+            "suggestions", "similar", "years", "budget", "gift", "train", "jumped", "got", 
+            "bought", "found", "try", "no", "yes", "new", "old", "best", "good", "great", 
+            "really", "much", "many", "some", "any", "all", "durable", "american", "eagle",
+            "smoked", "carolina", "reaper", "jewish", "space", "laser", "activation", "panel"
+        }
+        words = [w for w in name.lower().split() if w not in STOP_WORDS and len(w) > 2]
+        return " ".join(words[:4])
+
     async def _get_real_aliexpress_data(self, product_name: str, rapidapi_key: str) -> Dict | None:
         try:
+            search_query = self._get_search_query(product_name)
+            if not search_query:
+                search_query = product_name
+
             url = "https://aliexpress-true-api.p.rapidapi.com/api/v3/products"
             headers = {
                 "X-RapidAPI-Key": rapidapi_key,
                 "X-RapidAPI-Host": "aliexpress-true-api.p.rapidapi.com"
             }
             params = {
-                "keywords": product_name,
+                "keywords": search_query,
                 "target_currency": "USD",
                 "ship_to_country": "US",
                 "sort": "LAST_VOLUME_DESC",
@@ -151,28 +168,30 @@ class ScraperService:
                 
                 data = response.json()
                 
-                # DEBUG: Log the exact JSON structure so we can see what RapidAPI returns
-                logger.info(f"[SCRAPER] RapidAPI raw response for '{product_name}': {str(data)[:300]}")
-                
+                # FIXED JSON PARSER: Handles the exact structure RapidAPI returns
                 products_list = []
                 if isinstance(data, dict):
-                    if "data" in data and isinstance(data["data"], dict) and "products" in data["data"]:
+                    if "products" in data:
+                        prods = data["products"]
+                        if isinstance(prods, dict) and "product" in prods:
+                            products_list = prods["product"]
+                        elif isinstance(prods, list):
+                            products_list = prods
+                    elif "data" in data and isinstance(data["data"], dict) and "products" in data["data"]:
                         products_list = data["data"]["products"]
-                    elif "products" in data:
-                        products_list = data["products"]
                     elif "data" in data and isinstance(data["data"], list):
                         products_list = data["data"]
                 elif isinstance(data, list):
                     products_list = data
                     
                 if not products_list:
-                    logger.warning(f"[SCRAPER] No products list found in RapidAPI response")
+                    logger.warning(f"[SCRAPER] No products found for '{search_query}'")
                     return None
                 
                 top_product = products_list[0]
                 
                 price = 0
-                for key in ["sale_price", "min_price", "price", "target_sale_price", "original_price", "minAmount", "salePrice"]:
+                for key in ["sale_price", "min_price", "original_price", "price", "target_sale_price", "minAmount", "salePrice"]:
                     val = top_product.get(key)
                     if val:
                         try:
@@ -193,12 +212,13 @@ class ScraperService:
                             break
                         except: pass
                         
-                product_url = top_product.get("product_url") or top_product.get("url") or f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(product_name)}"
+                product_url = top_product.get("product_detail_url") or top_product.get("product_url") or top_product.get("url") or f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(search_query)}"
                 
                 markup = 3.0 if price < 10 else 2.5
                 sell_price = round((price * markup) + 2.50, 2) 
                 if sell_price < 19.99: sell_price = 19.99
                 
+                logger.info(f"[SCRAPER] SUCCESS: '{search_query}' -> Cost: ${price}, Sell: ${sell_price}")
                 return {"price": price, "sell_price": sell_price, "orders": orders, "url": product_url}
         except Exception as e:
             logger.warning(f"[SCRAPER] RapidAPI error for '{product_name}': {e}")
