@@ -18,12 +18,13 @@ from app.services.telegram_service import telegram_service
 
 logger = logging.getLogger(__name__)
 
+# Module-level set to prevent duplicate Telegram messages across app reloads/instances
+_GLOBAL_SENT_NOTIFICATIONS: Set[str] = set()
+
 
 class AgentResearcher:
-
     def __init__(self):
         self.agent = self._build_agent()
-        self._sent_notifications: Set[str] = set()
 
     def _build_tools(self):
         tools = [
@@ -74,6 +75,7 @@ class AgentResearcher:
                     src = p.get("source_data", {})
                     reddit = src.get("reddit", {})
                     trends = src.get("google_trends", {})
+                    
                     context = {
                         "product_title": p["title"],
                         "price": p["suggested_sell_price"],
@@ -88,6 +90,7 @@ class AgentResearcher:
                         "trend_interest": trends.get("interest_score", 0),
                         "aliexpress_listings": src.get("aliexpress_listings", 0),
                     }
+                    
                     sms = (
                         f"Found '{p['title'][:40]}' on {reddit.get('subreddit', 'Reddit')} "
                         f"({reddit.get('upvotes', 0)} upvotes). Sell: ${p['suggested_sell_price']:.2f} | "
@@ -95,7 +98,7 @@ class AgentResearcher:
                     )
                     timeout = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
 
-                    # Use dynamic port (Railway assigns PORT env var)
+                    # Use dynamic port (Railway assigns PORT env var, defaults to 8080)
                     port = os.getenv("PORT", "8080")
 
                     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -110,19 +113,19 @@ class AgentResearcher:
                             },
                             headers={"Authorization": "Bearer change_this_to_a_random_32_char_string"},
                         )
+                        
                         if resp.status_code == 201:
                             decision_data = resp.json()
                             decision_id = decision_data.get("id")
                             logger.info("[Researcher] Decision %s created for '%s'", decision_id, p["title"])
 
-                            # DEDUPLICATION: Don't send duplicate Telegram messages
+                            # DEDUPLICATION: Prevent sending the same product to Telegram twice
                             product_title = context.get("product_title", "")
                             notification_key = f"{product_title}_{datetime.now(timezone.utc).date()}"
 
-                            if notification_key not in self._sent_notifications:
-                                self._sent_notifications.add(notification_key)
+                            if notification_key not in _GLOBAL_SENT_NOTIFICATIONS:
+                                _GLOBAL_SENT_NOTIFICATIONS.add(notification_key)
 
-                                # SEND TELEGRAM NOTIFICATION
                                 if decision_id:
                                     try:
                                         await telegram_service.send_approval_request(
