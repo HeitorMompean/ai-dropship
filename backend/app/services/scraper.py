@@ -1,4 +1,4 @@
-"""Ultimate Production Scraper - Permanent Links + Daily Memory Reset + Strict Noun Filtering."""
+"""Ultimate Production Scraper - Strict Product Name Extraction."""
 import logging, os, urllib.parse, re
 from typing import List, Dict, Any, Set
 import httpx
@@ -29,52 +29,78 @@ CONTENT_BLACKLIST = [
     r"\b(list of|a list|things made|not made in|from canada|from usa|submission)\b",
 ]
 
-# MUST contain one of these concrete nouns to be considered a product
+# ONLY concrete physical product nouns - no generic terms like "hack", "diy", "tip"
 PRODUCT_NOUNS = {
-    "organizer", "storage", "holder", "stand", "mount", "rack", "charger", "cable", "adapter", 
-    "light", "lamp", "led", "speaker", "headphone", "earbud", "watch", "tracker", "sensor", 
-    "camera", "lock", "cleaner", "purifier", "massager", "pillow", "blanket", "bag", "backpack", 
-    "wallet", "case", "cover", "tool", "kit", "gadget", "blender", "bottle", "cup", "mug", 
-    "yoga", "posture", "pet", "garden", "camping", "grinder", "cutter", "sharpener", "brush", 
-    "comb", "mirror", "knife", "scissors", "grill", "pot", "pan", "tray", "mat", "pad", "hook", 
-    "clip", "strap", "belt", "ring", "chain", "rope", "plug", "switch", "remote", "alarm", 
-    "detector", "gloves", "boots", "shoes", "hat", "cap", "umbrella", "perfume", "lotion", 
-    "cream", "soap", "razor", "dryer", "heater", "fan", "chair", "table", "desk", "rug", 
-    "curtain", "tent", "flashlight", "compass", "scale", "clock", "timer", "ruler", "glue", 
-    "tape", "stapler", "battery", "motor", "pump", "valve", "pipe", "gear", "bearing", "spring", 
-    "clamp", "weld", "solder", "filter", "screen", "fabric", "yarn", "thread", "screw", "bolt", 
-    "nut", "nail", "key", "latch", "hinge", "handle", "knob", "wheel", "pouch", "pen", 
-    "multitool", "dishwasher", "kettle", "thermos", "mower", "trimmer", "lantern", "headlamp",
-    "binoculars", "telescope", "microscope", "magnifier", "thermometer", "calculator", "level",
-    "binder", "folder", "envelope", "paper", "card", "label", "tag", "sticker", "stamp", "ink",
-    "toner", "cartridge", "ribbon", "film", "inverter", "generator", "solar", "panel", "controller",
-    "regulator", "fitting", "connector", "joint", "pulley", "clutch", "brake", "shock", "strut",
-    "anvil", "forge", "epoxy", "resin", "silicone", "caulk", "sealant", "putty", "clay", "dough",
-    "slime", "sand", "gravel", "rock", "stone", "brick", "block", "tile", "slate", "marble",
-    "granite", "quartz", "glass", "lens", "prism", "mesh", "net", "web", "cloth", "textile",
-    "string", "twine", "link", "hoop", "loop", "buckle", "clasp", "fastener", "pin", "rivet",
-    "anchor", "dowel", "peg", "catch", "eye", "hoodie", "shirt", "jacket", "coat", "pants",
-    "shorts", "skirt", "dress", "suit", "tie", "scarf", "sunglasses", "glasses", "bracelet",
-    "necklace", "earring", "cologne", "shampoo", "conditioner", "towel", "toothbrush", "toothpaste",
-    "shaver", "clipper", "iron", "steamer", "cooler", "ac", "fridge", "freezer", "oven", "stove",
-    "microwave", "toaster", "maker", "mixer", "juicer", "wok", "skillet", "smoker", "sofa", "couch",
-    "carpet", "blind", "shade", "soil", "seed", "fertilizer", "hose", "sprinkler", "sleeping",
-    "radio", "gps", "weather", "station", "stopwatch", "square", "plumb", "chalk", "marker",
-    "crayon", "pencil", "eraser", "converter", "transformer", "tube", "bracket", "vise", "braze"
+    # Electronics & Accessories
+    "charger", "cable", "adapter", "hub", "power bank", "battery", "speaker", "headphone", 
+    "earbud", "microphone", "watch", "tracker", "band", "camera", "lock", "sensor", "alarm",
+    "remote", "switch", "plug", "socket", "monitor", "display", "projector", "printer", 
+    "scanner", "router", "modem", "antenna", "receiver", "amplifier", "webcam", "tripod",
+    "gimbal", "drone", "helmet", "goggles", "flashlight", "headlamp", "lantern",
+    
+    # Storage & Organization
+    "organizer", "storage", "holder", "stand", "mount", "rack", "shelf", "drawer", "box",
+    "bin", "basket", "tray", "case", "cover", "bag", "backpack", "wallet", "pouch", "purse",
+    
+    # Home & Kitchen
+    "cleaner", "purifier", "humidifier", "vacuum", "robot", "massager", "pillow", "blanket",
+    "mattress", "cushion", "blender", "cutter", "kettle", "thermos", "bottle", "cup", "mug",
+    "pot", "pan", "wok", "skillet", "grill", "smoker", "toaster", "oven", "stove", "fridge",
+    "freezer", "microwave", "mixer", "juicer", "maker", "grinder", "sharpener", "knife",
+    "scissors", "brush", "comb", "mirror", "towel", "curtain", "blind", "shade", "rug",
+    "carpet", "mat", "pad",
+    
+    # Tools & Hardware
+    "tool", "kit", "set", "wrench", "screwdriver", "drill", "saw", "hammer", "pliers",
+    "clamp", "vise", "anvil", "forge", "weld", "solder", "tape", "glue", "epoxy", "resin",
+    "silicone", "caulk", "sealant", "putty", "screw", "bolt", "nut", "nail", "rivet",
+    "anchor", "dowel", "peg", "pin", "key", "latch", "hinge", "handle", "knob", "wheel",
+    "gear", "bearing", "spring", "pulley", "belt", "chain", "rope", "cord", "wire", "tube",
+    "pipe", "valve", "pump", "motor", "fitting", "connector", "joint", "bracket", "hook",
+    "clip", "strap",
+    
+    # Fitness & Outdoor
+    "yoga", "posture", "corrector", "brace", "band", "fitness", "exercise", "garden",
+    "plant", "outdoor", "camping", "hiking", "travel", "tent", "sleeping", "cooler",
+    "mower", "trimmer", "blower", "hose", "sprinkler", "compass", "gps", "binoculars",
+    "telescope", "microscope", "magnifier", "scale", "thermometer", "hygrometer",
+    "barometer", "anemometer", "weather", "station", "clock", "timer", "stopwatch",
+    
+    # Clothing & Accessories
+    "gloves", "boots", "shoes", "socks", "shirt", "jacket", "coat", "pants", "shorts",
+    "skirt", "dress", "suit", "tie", "scarf", "hat", "cap", "umbrella", "sunglasses",
+    "glasses", "bracelet", "necklace", "earring", "ring", "perfume", "cologne", "lotion",
+    "cream", "soap", "shampoo", "conditioner", "toothbrush", "toothpaste", "razor",
+    "shaver", "clipper", "dryer", "iron", "steamer", "heater", "fan",
+    
+    # Furniture
+    "chair", "table", "desk", "bed", "sofa", "couch",
+    
+    # Office & Stationery
+    "calculator", "ruler", "level", "binder", "folder", "envelope", "paper", "card",
+    "label", "tag", "sticker", "stamp", "ink", "toner", "cartridge", "ribbon", "film",
+    "pen", "pencil", "marker", "crayon", "eraser", "stapler", "staple", "punch",
+    
+    # Pet & Baby
+    "pet", "dog", "cat", "toy", "baby", "kid",
 }
 
-# Verbs that indicate a conversational sentence, not a product
+# Verbs and generic terms that indicate conversation, not products
 VERBS = {
-    "wash", "try", "got", "bought", "found", "jumped", "works", "love", "need", "want", "use", 
-    "make", "keep", "cut", "break", "fix", "rotation", "edc", "budget", "gift", "suggestions", 
-    "wanted", "recommend", "thinking", "looking", "help", "please", "show", "tell", "give"
+    "wash", "try", "got", "bought", "found", "jumped", "works", "love", "need", "want", 
+    "use", "make", "keep", "cut", "break", "fix", "rotation", "edc", "budget", "gift", 
+    "suggestions", "wanted", "recommend", "thinking", "looking", "help", "please", "show", 
+    "tell", "give", "hack", "diy", "tip", "trick", "idea", "way", "method", "technique",
+    "lifehack", "life", "hack", "how", "to", "your", "you", "my", "me", "we", "us", "they",
+    "them", "he", "she", "it", "this", "that", "these", "those", "here", "there", "where",
+    "when", "why", "what", "which", "who", "whom", "whose"
 }
 
 class ScraperService:
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
         logger.info("[SCRAPER] Starting Permissive Scrape")
         
-        # FIX: Clear memory so it doesn't block today's run based on yesterday's cache
+        # Clear memory so it doesn't block today's run based on yesterday's cache
         global _GLOBAL_SEEN
         _GLOBAL_SEEN.clear()
         
@@ -157,19 +183,26 @@ class ScraperService:
     def _extract_product_name(self, title: str) -> str | None:
         title_lower = title.lower()
         
-        if any(brand in title_lower for brand in BRAND_BLACKLIST): return None
-        for pattern in CONTENT_BLACKLIST:
-            if re.search(pattern, title_lower): return None
-            
-        # MUST contain at least one concrete product noun
-        if not any(noun in title_lower for noun in PRODUCT_NOUNS):
+        # Check brand blacklist
+        if any(brand in title_lower for brand in BRAND_BLACKLIST):
             return None
             
-        # Reject if it contains conversational verbs
+        # Check content blacklist
+        for pattern in CONTENT_BLACKLIST:
+            if re.search(pattern, title_lower):
+                return None
+        
+        # Split into words and check for verbs/generic terms FIRST
         words_raw = title_lower.split()
         if any(w in VERBS for w in words_raw):
             return None
+            
+        # MUST contain at least one concrete product noun
+        found_nouns = [noun for noun in PRODUCT_NOUNS if noun in title_lower]
+        if not found_nouns:
+            return None
         
+        # Clean up the title
         name = re.sub(r"\[.*?\]", "", title)
         name = re.sub(r"\(.*?\)", "", name)
         name = re.sub(r"^(I|we|my|this|the|a|an|just|finally|so|but|and)\s+", "", name, flags=re.I)
@@ -177,8 +210,20 @@ class ScraperService:
         name = re.sub(r"\s+", " ", name).strip()
         
         words = name.split()
-        if len(words) < 2 or len(words) > 6: return None
-        if 5 <= len(name) <= 50: return name
+        
+        # Must be 2-6 words
+        if len(words) < 2 or len(words) > 6:
+            return None
+        
+        # Check if the cleaned name still contains a product noun
+        name_lower = name.lower()
+        if not any(noun in name_lower for noun in PRODUCT_NOUNS):
+            return None
+        
+        # Must be 5-50 characters
+        if 5 <= len(name) <= 50:
+            return name
+        
         return None
 
     def _get_search_query(self, name: str) -> str:
