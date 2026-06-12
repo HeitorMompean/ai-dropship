@@ -18,10 +18,6 @@ from app.services.telegram_service import telegram_service
 
 logger = logging.getLogger(__name__)
 
-# Module-level set to prevent duplicate Telegram messages across app reloads/instances
-_GLOBAL_SENT_NOTIFICATIONS: Set[str] = set()
-
-
 class AgentResearcher:
     def __init__(self):
         self.agent = self._build_agent()
@@ -97,8 +93,6 @@ class AgentResearcher:
                         f"Cost: ${p['cost_price']:.2f}. Score: {total}/130."
                     )
                     timeout = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
-
-                    # Use dynamic port (Railway assigns PORT env var, defaults to 8080)
                     port = os.getenv("PORT", "8080")
 
                     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -119,25 +113,39 @@ class AgentResearcher:
                             decision_id = decision_data.get("id")
                             logger.info("[Researcher] Decision %s created for '%s'", decision_id, p["title"])
 
-                            # DEDUPLICATION: Prevent sending the same product to Telegram twice
+                            # DATABASE DEDUPLICATION: Check if we already sent this exact product today
                             product_title = context.get("product_title", "")
-                            notification_key = f"{product_title}_{datetime.now(timezone.utc).date()}"
-
-                            if notification_key not in _GLOBAL_SENT_NOTIFICATIONS:
-                                _GLOBAL_SENT_NOTIFICATIONS.add(notification_key)
-
-                                if decision_id:
-                                    try:
-                                        await telegram_service.send_approval_request(
-                                            decision_id=decision_id,
-                                            agent_name="researcher",
-                                            decision_type="product_approval",
-                                            sms_text=sms,
-                                            context=context,
-                                        )
-                                        logger.info("[Researcher] Telegram notification sent for decision %s", decision_id)
-                                    except Exception as te:
-                                        logger.error("[Researcher] Telegram send failed: %s", te)
+                            already_sent = False
+                            try:
+                                check_resp = await client.get(
+                                    f"http://127.0.0.1:{port}/api/decisions",
+                                    headers={"Authorization": "Bearer change_this_to_a_random_32_char_string"}
+                                )
+                                if check_resp.status_code == 200:
+                                    existing = check_resp.json()
+                                    today = datetime.now(timezone.utc).date().isoformat()
+                                    for dec in existing:
+                                        if (dec.get("context_json", {}).get("product_title") == product_title and 
+                                            dec.get("created_at", "")[:10] == today and dec.get("id") != decision_id):
+                                            already_sent = True
+                                            break
+                            except Exception as db_e:
+                                logger.warning(f"[Researcher] DB check failed: {db_e}")
+                            
+                            if not already_sent and decision_id:
+                                try:
+                                    await telegram_service.send_approval_request(
+                                        decision_id=decision_id,
+                                        agent_name="researcher",
+                                        decision_type="product_approval",
+                                        sms_text=sms,
+                                        context=context,
+                                    )
+                                    logger.info("[Researcher] Telegram notification sent for decision %s", decision_id)
+                                except Exception as te:
+                                    logger.error("[Researcher] Telegram send failed: %s", te)
+                            else:
+                                logger.info("[Researcher] Skipped duplicate Telegram send for '%s'", product_title)
 
                             decisions += 1
                         else:
