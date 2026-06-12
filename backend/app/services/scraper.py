@@ -1,4 +1,4 @@
-"""Ultimate Production Scraper - Smart Search Queries + Fixed RapidAPI Parsing."""
+"""Ultimate Production Scraper - Permanent Links + Daily Memory Reset."""
 import logging, os, urllib.parse, re
 from typing import List, Dict, Any, Set
 import httpx
@@ -33,6 +33,10 @@ CONTENT_BLACKLIST = [
 class ScraperService:
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
         logger.info("[SCRAPER] Starting Permissive Scrape")
+        
+        # FIX 1: Clear memory so it doesn't block today's run based on yesterday's cache
+        global _GLOBAL_SEEN
+        _GLOBAL_SEEN.clear()
         
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
@@ -128,7 +132,7 @@ class ScraperService:
         return None
 
     def _get_search_query(self, name: str) -> str:
-        """Extract core keywords for AliExpress search by removing stop words and brands."""
+        # FIX 3: Added conversational fluff words to ignore
         STOP_WORDS = {
             "the", "a", "an", "my", "your", "our", "this", "that", "is", "are", "was", "were", 
             "for", "on", "with", "at", "by", "from", "as", "and", "or", "but", "if", "then", 
@@ -136,16 +140,15 @@ class ScraperService:
             "suggestions", "similar", "years", "budget", "gift", "train", "jumped", "got", 
             "bought", "found", "try", "no", "yes", "new", "old", "best", "good", "great", 
             "really", "much", "many", "some", "any", "all", "durable", "american", "eagle",
-            "smoked", "carolina", "reaper", "jewish", "space", "laser", "activation", "panel"
+            "smoked", "carolina", "reaper", "jewish", "space", "laser", "activation", "panel",
+            "love", "sub", "another", "day", "pouch"
         }
         words = [w for w in name.lower().split() if w not in STOP_WORDS and len(w) > 2]
-        return " ".join(words[:4])
+        return " ".join(words[:4]) if words else name
 
     async def _get_real_aliexpress_data(self, product_name: str, rapidapi_key: str) -> Dict | None:
         try:
             search_query = self._get_search_query(product_name)
-            if not search_query:
-                search_query = product_name
 
             url = "https://aliexpress-true-api.p.rapidapi.com/api/v3/products"
             headers = {
@@ -162,13 +165,10 @@ class ScraperService:
             
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.get(url, headers=headers, params=params)
-                if response.status_code != 200: 
-                    logger.warning(f"[SCRAPER] RapidAPI status {response.status_code}")
-                    return None
+                if response.status_code != 200: return None
                 
                 data = response.json()
                 
-                # FIXED JSON PARSER: Handles the exact structure RapidAPI returns
                 products_list = []
                 if isinstance(data, dict):
                     if "products" in data:
@@ -179,19 +179,15 @@ class ScraperService:
                             products_list = prods
                     elif "data" in data and isinstance(data["data"], dict) and "products" in data["data"]:
                         products_list = data["data"]["products"]
-                    elif "data" in data and isinstance(data["data"], list):
-                        products_list = data["data"]
                 elif isinstance(data, list):
                     products_list = data
                     
-                if not products_list:
-                    logger.warning(f"[SCRAPER] No products found for '{search_query}'")
-                    return None
+                if not products_list: return None
                 
                 top_product = products_list[0]
                 
                 price = 0
-                for key in ["sale_price", "min_price", "original_price", "price", "target_sale_price", "minAmount", "salePrice"]:
+                for key in ["sale_price", "min_price", "original_price", "price", "target_sale_price"]:
                     val = top_product.get(key)
                     if val:
                         try:
@@ -199,9 +195,7 @@ class ScraperService:
                             if price > 0: break
                         except: pass
                         
-                if price <= 0:
-                    logger.warning(f"[SCRAPER] No valid price found. Keys: {list(top_product.keys())}")
-                    return None
+                if price <= 0: return None
                 
                 orders = 0
                 for key in ["total_sale", "orders", "sales", "tradeCount"]:
@@ -212,7 +206,19 @@ class ScraperService:
                             break
                         except: pass
                         
-                product_url = top_product.get("product_detail_url") or top_product.get("product_url") or top_product.get("url") or f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(search_query)}"
+                # FIX 2: Extract clean Product ID to prevent expired tracking links
+                product_id = top_product.get("product_id") or top_product.get("id") or top_product.get("productId")
+                if not product_id:
+                    url_str = top_product.get("product_detail_url", "")
+                    match = re.search(r'/item/(\d+)', url_str)
+                    if match:
+                        product_id = match.group(1)
+                
+                if product_id:
+                    # Clean, permanent URL that never expires or redirects
+                    product_url = f"https://www.aliexpress.com/item/{product_id}.html"
+                else:
+                    product_url = top_product.get("product_detail_url") or f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(search_query)}"
                 
                 markup = 3.0 if price < 10 else 2.5
                 sell_price = round((price * markup) + 2.50, 2) 
