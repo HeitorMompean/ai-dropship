@@ -1,4 +1,4 @@
-"""Ultimate Production Scraper - Permanent Links + Daily Memory Reset."""
+"""Ultimate Production Scraper - Permanent Links + Daily Memory Reset + Strict Noun Filtering."""
 import logging, os, urllib.parse, re
 from typing import List, Dict, Any, Set
 import httpx
@@ -14,7 +14,7 @@ BRAND_BLACKLIST = {
     "xiaomi", "huawei", "nvidia", "amd", "intel", "radeon", "geforce",
     "sennheiser", "bose", "jbl", "beats", "airpods", "macbook", "iphone", "ipad",
     "pixel", "galaxy", "oneplus", "dell xps", "macbook pro", "predator", "arduboy", "gopro",
-    "speed queen", "casio"
+    "speed queen", "casio", "american eagle"
 }
 
 CONTENT_BLACKLIST = [
@@ -27,14 +27,54 @@ CONTENT_BLACKLIST = [
     r"\b(crypto|bitcoin|stock|invest|money|finance|bank)\b",
     r"\b(politics|government|law|court|crime|war|military|weapon|gun)\b",
     r"\b(list of|a list|things made|not made in|from canada|from usa|submission)\b",
-    r"\b(jewish|space|laser|activation|panel)\b",
 ]
+
+# MUST contain one of these concrete nouns to be considered a product
+PRODUCT_NOUNS = {
+    "organizer", "storage", "holder", "stand", "mount", "rack", "charger", "cable", "adapter", 
+    "light", "lamp", "led", "speaker", "headphone", "earbud", "watch", "tracker", "sensor", 
+    "camera", "lock", "cleaner", "purifier", "massager", "pillow", "blanket", "bag", "backpack", 
+    "wallet", "case", "cover", "tool", "kit", "gadget", "blender", "bottle", "cup", "mug", 
+    "yoga", "posture", "pet", "garden", "camping", "grinder", "cutter", "sharpener", "brush", 
+    "comb", "mirror", "knife", "scissors", "grill", "pot", "pan", "tray", "mat", "pad", "hook", 
+    "clip", "strap", "belt", "ring", "chain", "rope", "plug", "switch", "remote", "alarm", 
+    "detector", "gloves", "boots", "shoes", "hat", "cap", "umbrella", "perfume", "lotion", 
+    "cream", "soap", "razor", "dryer", "heater", "fan", "chair", "table", "desk", "rug", 
+    "curtain", "tent", "flashlight", "compass", "scale", "clock", "timer", "ruler", "glue", 
+    "tape", "stapler", "battery", "motor", "pump", "valve", "pipe", "gear", "bearing", "spring", 
+    "clamp", "weld", "solder", "filter", "screen", "fabric", "yarn", "thread", "screw", "bolt", 
+    "nut", "nail", "key", "latch", "hinge", "handle", "knob", "wheel", "pouch", "pen", 
+    "multitool", "dishwasher", "kettle", "thermos", "mower", "trimmer", "lantern", "headlamp",
+    "binoculars", "telescope", "microscope", "magnifier", "thermometer", "calculator", "level",
+    "binder", "folder", "envelope", "paper", "card", "label", "tag", "sticker", "stamp", "ink",
+    "toner", "cartridge", "ribbon", "film", "inverter", "generator", "solar", "panel", "controller",
+    "regulator", "fitting", "connector", "joint", "pulley", "clutch", "brake", "shock", "strut",
+    "anvil", "forge", "epoxy", "resin", "silicone", "caulk", "sealant", "putty", "clay", "dough",
+    "slime", "sand", "gravel", "rock", "stone", "brick", "block", "tile", "slate", "marble",
+    "granite", "quartz", "glass", "lens", "prism", "mesh", "net", "web", "cloth", "textile",
+    "string", "twine", "link", "hoop", "loop", "buckle", "clasp", "fastener", "pin", "rivet",
+    "anchor", "dowel", "peg", "catch", "eye", "hoodie", "shirt", "jacket", "coat", "pants",
+    "shorts", "skirt", "dress", "suit", "tie", "scarf", "sunglasses", "glasses", "bracelet",
+    "necklace", "earring", "cologne", "shampoo", "conditioner", "towel", "toothbrush", "toothpaste",
+    "shaver", "clipper", "iron", "steamer", "cooler", "ac", "fridge", "freezer", "oven", "stove",
+    "microwave", "toaster", "maker", "mixer", "juicer", "wok", "skillet", "smoker", "sofa", "couch",
+    "carpet", "blind", "shade", "soil", "seed", "fertilizer", "hose", "sprinkler", "sleeping",
+    "radio", "gps", "weather", "station", "stopwatch", "square", "plumb", "chalk", "marker",
+    "crayon", "pencil", "eraser", "converter", "transformer", "tube", "bracket", "vise", "braze"
+}
+
+# Verbs that indicate a conversational sentence, not a product
+VERBS = {
+    "wash", "try", "got", "bought", "found", "jumped", "works", "love", "need", "want", "use", 
+    "make", "keep", "cut", "break", "fix", "rotation", "edc", "budget", "gift", "suggestions", 
+    "wanted", "recommend", "thinking", "looking", "help", "please", "show", "tell", "give"
+}
 
 class ScraperService:
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
         logger.info("[SCRAPER] Starting Permissive Scrape")
         
-        # FIX 1: Clear memory so it doesn't block today's run based on yesterday's cache
+        # FIX: Clear memory so it doesn't block today's run based on yesterday's cache
         global _GLOBAL_SEEN
         _GLOBAL_SEEN.clear()
         
@@ -116,10 +156,20 @@ class ScraperService:
 
     def _extract_product_name(self, title: str) -> str | None:
         title_lower = title.lower()
+        
         if any(brand in title_lower for brand in BRAND_BLACKLIST): return None
         for pattern in CONTENT_BLACKLIST:
             if re.search(pattern, title_lower): return None
             
+        # MUST contain at least one concrete product noun
+        if not any(noun in title_lower for noun in PRODUCT_NOUNS):
+            return None
+            
+        # Reject if it contains conversational verbs
+        words_raw = title_lower.split()
+        if any(w in VERBS for w in words_raw):
+            return None
+        
         name = re.sub(r"\[.*?\]", "", title)
         name = re.sub(r"\(.*?\)", "", name)
         name = re.sub(r"^(I|we|my|this|the|a|an|just|finally|so|but|and)\s+", "", name, flags=re.I)
@@ -127,12 +177,11 @@ class ScraperService:
         name = re.sub(r"\s+", " ", name).strip()
         
         words = name.split()
-        if len(words) < 2 or len(words) > 8: return None
-        if 5 <= len(name) <= 60: return name
+        if len(words) < 2 or len(words) > 6: return None
+        if 5 <= len(name) <= 50: return name
         return None
 
     def _get_search_query(self, name: str) -> str:
-        # FIX 3: Added conversational fluff words to ignore
         STOP_WORDS = {
             "the", "a", "an", "my", "your", "our", "this", "that", "is", "are", "was", "were", 
             "for", "on", "with", "at", "by", "from", "as", "and", "or", "but", "if", "then", 
@@ -141,7 +190,7 @@ class ScraperService:
             "bought", "found", "try", "no", "yes", "new", "old", "best", "good", "great", 
             "really", "much", "many", "some", "any", "all", "durable", "american", "eagle",
             "smoked", "carolina", "reaper", "jewish", "space", "laser", "activation", "panel",
-            "love", "sub", "another", "day", "pouch"
+            "love", "sub", "another", "day", "pouch", "wash", "ball", "hats", "in", "dishwasher"
         }
         words = [w for w in name.lower().split() if w not in STOP_WORDS and len(w) > 2]
         return " ".join(words[:4]) if words else name
@@ -206,7 +255,7 @@ class ScraperService:
                             break
                         except: pass
                         
-                # FIX 2: Extract clean Product ID to prevent expired tracking links
+                # Extract clean Product ID to prevent expired tracking links
                 product_id = top_product.get("product_id") or top_product.get("id") or top_product.get("productId")
                 if not product_id:
                     url_str = top_product.get("product_detail_url", "")
@@ -215,7 +264,6 @@ class ScraperService:
                         product_id = match.group(1)
                 
                 if product_id:
-                    # Clean, permanent URL that never expires or redirects
                     product_url = f"https://www.aliexpress.com/item/{product_id}.html"
                 else:
                     product_url = top_product.get("product_detail_url") or f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(search_query)}"
