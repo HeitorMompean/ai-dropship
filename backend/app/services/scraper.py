@@ -18,9 +18,11 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-SUBREDDITS = ["shutupandtakemymoney", "BuyItForLife", "gadgets", "EDC", "lifehacks"]
-
-_GLOBAL_SEEN: Set[str] = set()
+SUBREDDITS = [
+    "shutupandtakemymoney", "BuyItForLife", "gadgets", "EDC", "lifehacks",
+    "ProductPorn", "INEEEEDIT", "DidntKnowIWantedThat", "somethingimade",
+    "gifts", "ofcoursethatsathing", "BuyItForLifeUK",
+]
 
 BRAND_BLACKLIST = {
     "apple", "samsung", "google", "microsoft", "sony", "nintendo", "xbox", "playstation",
@@ -31,15 +33,18 @@ BRAND_BLACKLIST = {
 }
 
 CONTENT_BLACKLIST = [
+    # discussion-signal patterns (post is talking about, not selling, a product)
     r"\b(review|reviews|vs\.?|versus|comparison|compared)\b",
     r"\b(news|announced|revealed|leaked|rumor|report|says|claims)\b",
     r"\b(meme|joke|funny|hilarious|gif|comic)\b",
-    r"\b(book|movie|game|show|series|film|album|song|music|netflix|youtube|twitch)\b",
-    r"\b(car|truck|vehicle|motorcycle|bike|bicycle)\b",
-    r"\b(food|drink|restaurant|recipe|coffee|tea|beer|wine)\b",
-    r"\b(crypto|bitcoin|stock|invest|money|finance|bank)\b",
-    r"\b(politics|government|law|court|crime|war|military|weapon|gun)\b",
+    # non-commerce / safety topics (always vetoed)
+    r"\b(crypto|bitcoin|stock|invest|finance|bank)\b",
+    r"\b(politics|government|election|court|crime|war|military|weapon|gun|ammo|knife\s+fight)\b",
     r"\b(list of|a list|things made|not made in|from canada|from usa|submission)\b",
+    # NOTE: soft topical words (coffee/tea/bike/car/game/movie/music/food...) were
+    # REMOVED — they frequently appear inside real product names ("coffee grinder",
+    # "bike phone mount", "game controller", "music stand"). The downstream relevance
+    # check + price window now guard against genuinely irrelevant results.
 ]
 
 MINIMUM_WORDS = 3  # titles shorter than this are conversational noise, not products
@@ -99,14 +104,28 @@ PRODUCT_NOUNS = {
     "cream", "soap", "razor", "dryer", "heater", "fan", "chair", "table", "desk", "rug",
     "curtain", "tent", "flashlight", "compass", "scale", "clock", "timer", "ruler", "glue",
     "tape", "stapler", "battery", "motor", "pump", "valve", "pipe", "gear", "bearing", "spring",
-    # ... (100+ more nouns, see full file on GitHub)
+    # --- expanded set (v3.3): common physical / dropshipping product nouns ---
+    "briefcase", "purse", "tote", "duffel", "pouch", "sleeve", "thermos", "tumbler", "flask",
+    "kettle", "teapot", "jar", "container", "lunchbox", "cooler", "multitool", "pliers", "wrench",
+    "screwdriver", "drill", "hammer", "axe", "hatchet", "clamp", "lantern", "sunglasses", "goggles",
+    "scarf", "beanie", "socks", "slippers", "sandals", "sneakers", "insole", "leash", "collar",
+    "carrier", "feeder", "fountain", "aquarium", "planter", "hose", "nozzle", "sprinkler", "shovel",
+    "rake", "shears", "hammock", "stove", "tongs", "spatula", "whisk", "ladle", "peeler", "grater",
+    "colander", "strainer", "funnel", "juicer", "coaster", "apron", "towel", "sponge", "mop",
+    "broom", "bucket", "basket", "bin", "hamper", "hanger", "shelf", "drawer", "cabinet", "stool",
+    "bench", "cushion", "vase", "frame", "sticker", "magnet", "keychain", "lanyard", "bracelet",
+    "necklace", "earring", "pendant", "trimmer", "clipper", "tweezers", "diffuser", "humidifier",
+    "thermometer", "projector", "keyboard", "mouse", "mousepad", "webcam", "microphone", "tripod",
+    "stylus", "dock", "hub", "router", "antenna", "powerbank", "controller", "gamepad", "headset",
+    "earphone", "soundbar", "subwoofer", "amplifier", "kettlebell", "dumbbell", "mask", "wallet",
+    "opener", "corkscrew", "thermostat", "doorbell", "scraper", "trowel", "caddy", "rollerball",
 }
 
 
 class ScraperService:
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        logger.info("[SCRAPER] Starting Strict Scrape v3.2 (real names + real prices + cheapest in-window variant)")
+        logger.info("[SCRAPER] Starting Strict Scrape v3.3 (wider funnel: +nouns, +subreddits, per-run dedup)")
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
             logger.error("[SCRAPER] RAPIDAPI_KEY not set!")
@@ -115,14 +134,18 @@ class ScraperService:
         posts = await self._get_reddit_posts()
         logger.info(f"[SCRAPER] Got {len(posts)} posts from Reddit")
 
-        # Step 1: extract clean SEARCH KEYWORDS (not final names) from Reddit titles
+        # Step 1: extract clean SEARCH KEYWORDS (not final names) from Reddit titles.
+        # Dedup is per-run (local) so manual re-triggers and scheduled runs can
+        # re-surface still-trending products, instead of a process-lifetime set
+        # that permanently starves later runs of the same hot posts.
+        seen: Set[str] = set()
         candidates = []
         for post in posts:
             keyword = self._extract_search_keyword(post["title"])
             if keyword:
                 key = keyword.lower()
-                if key not in _GLOBAL_SEEN:
-                    _GLOBAL_SEEN.add(key)
+                if key not in seen:
+                    seen.add(key)
                     candidates.append({
                         "keyword": keyword,
                         "subreddit": post["subreddit"],
