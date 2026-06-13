@@ -106,7 +106,7 @@ PRODUCT_NOUNS = {
 class ScraperService:
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        logger.info("[SCRAPER] Starting Strict Scrape v3.1 (real names + real prices only)")
+        logger.info("[SCRAPER] Starting Strict Scrape v3.2 (real names + real prices + cheapest in-window variant)")
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
             logger.error("[SCRAPER] RAPIDAPI_KEY not set!")
@@ -384,7 +384,11 @@ class ScraperService:
                     logger.warning(f"[SCRAPER] No results for '{keyword}'")
                     return None
 
-                # Walk candidates: need a real price AND a relevant title.
+                # Collect ALL relevant priced variants from the (up to 5) results,
+                # instead of taking the first one. AliExpress returns a mix of
+                # cheap and premium/bulk listings; the first-by-volume result is
+                # often the expensive one ($60 electric grinder vs a $15 manual).
+                candidates = []
                 for candidate in products_list[:5]:
                     if not isinstance(candidate, dict):
                         continue
@@ -395,36 +399,49 @@ class ScraperService:
                     if not self._is_relevant(keyword, raw_title):
                         logger.info(f"[SCRAPER] Irrelevant result for '{keyword}': '{raw_title[:60]}'")
                         continue
-
                     name = self._clean_ali_title(raw_title)
                     if len(name) < 3:
                         continue
-
-                    orders = self._extract_orders(candidate)
-                    product_url = (candidate.get("product_detail_url") or
-                                   candidate.get("product_url") or
-                                   candidate.get("url") or
-                                   f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(keyword)}")
 
                     markup = 3.0 if price < 10 else 2.5
                     sell_price = round((price * markup) + 2.50, 2)
                     if sell_price < 19.99:
                         sell_price = 19.99
 
-                    logger.info(
-                        f"[SCRAPER] MATCH '{keyword}' -> '{name}' | "
-                        f"Cost: ${price}, Sell: ${sell_price}, Orders: {orders}"
-                    )
-                    return {
+                    candidates.append({
                         "name": name,
                         "price": price,
                         "sell_price": sell_price,
-                        "orders": orders,
-                        "url": product_url
-                    }
+                        "orders": self._extract_orders(candidate),
+                        "url": (candidate.get("product_detail_url") or
+                                candidate.get("product_url") or
+                                candidate.get("url") or
+                                f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(keyword)}"),
+                    })
 
-                logger.warning(f"[SCRAPER] No relevant priced listing for '{keyword}'")
-                return None
+                if not candidates:
+                    logger.warning(f"[SCRAPER] No relevant priced listing for '{keyword}'")
+                    return None
+
+                # Prefer variants whose sell price lands in the impulse-buy window;
+                # among those, pick the cheapest (best margin headroom). If none fit
+                # the window, drop the product rather than shipping a $154 listing.
+                in_window = [c for c in candidates if MIN_SELL_PRICE <= c["sell_price"] <= MAX_SELL_PRICE]
+                if not in_window:
+                    cheapest = min(candidates, key=lambda c: c["sell_price"])
+                    logger.info(
+                        f"[SCRAPER] DROP '{keyword}': no variant in ${MIN_SELL_PRICE}-${MAX_SELL_PRICE} "
+                        f"(cheapest of {len(candidates)} was '{cheapest['name']}' @ sell ${cheapest['sell_price']})"
+                    )
+                    return None
+
+                chosen = min(in_window, key=lambda c: c["sell_price"])
+                logger.info(
+                    f"[SCRAPER] MATCH '{keyword}' -> '{chosen['name']}' | "
+                    f"Cost: ${chosen['price']}, Sell: ${chosen['sell_price']}, Orders: {chosen['orders']} "
+                    f"({len(in_window)}/{len(candidates)} variants in window)"
+                )
+                return chosen
         except Exception as e:
             logger.warning(f"[SCRAPER] RapidAPI error for '{keyword}': {e}")
             return None
