@@ -1,5 +1,20 @@
-"""Product Research Specialist — auto-creates Telegram decisions with notifications."""
+"""Product Research Specialist — auto-creates Telegram decisions with notifications.
+
+FIXES (v2):
+  - DUPLICATE CARDS: the POST /api/decisions endpoint already sends the Telegram
+    approval card. The researcher used to send a SECOND one — removed. The
+    decisions endpoint is now the single notifier (it also serves other agents,
+    e.g. the support/refund flow), so every decision gets exactly one card.
+  - DB CHECK CRASH ('str' object has no attribute 'get'): GET /api/decisions
+    returns {"items": [...], "total": N} (a dict), not a bare list. Iterating it
+    yielded the dict KEYS (strings), so dec.get(...) crashed. Now we read
+    body["items"] and parse each item defensively.
+  - Dedup moved BEFORE creation: we skip creating+notifying a product that
+    already has a decision from today, instead of creating it and then trying
+    (and failing) to suppress the duplicate notification afterwards.
+"""
 import os
+import json
 import logging
 from typing import Any, Dict, Set
 import httpx
@@ -17,6 +32,11 @@ from app.services.scraper import scraper
 from app.services.telegram_service import telegram_service
 
 logger = logging.getLogger(__name__)
+
+# The decisions API currently ignores this header, but we keep sending it so that
+# adding auth later is a one-line server change. Prefer an env var over the literal.
+_INTERNAL_TOKEN = os.getenv("INTERNAL_API_TOKEN", "change_this_to_a_random_32_char_string")
+
 
 class AgentResearcher:
     def __init__(self):
@@ -44,12 +64,46 @@ class AgentResearcher:
             verbose=True,
         )
 
+    @staticmethod
+    async def _already_posted_today(client: httpx.AsyncClient, base: str, title: str) -> bool:
+        """True if a decision for this exact product_title already exists today.
+
+        Reads {"items": [...]} defensively so a schema/shape change can't crash
+        the run (the old code iterated the dict's keys and hit
+        'str' object has no attribute 'get').
+        """
+        try:
+            resp = await client.get(f"{base}/api/decisions",
+                                    headers={"Authorization": f"Bearer {_INTERNAL_TOKEN}"})
+            if resp.status_code != 200:
+                return False
+            body = resp.json()
+            existing = body.get("items", []) if isinstance(body, dict) else (body or [])
+            today = datetime.now(timezone.utc).date().isoformat()
+            for dec in existing:
+                if not isinstance(dec, dict):
+                    continue
+                dctx = dec.get("context_json") or {}
+                if isinstance(dctx, str):
+                    try:
+                        dctx = json.loads(dctx)
+                    except Exception:
+                        dctx = {}
+                if dctx.get("product_title") == title and str(dec.get("created_at", ""))[:10] == today:
+                    return True
+        except Exception as db_e:
+            logger.warning("[Researcher] Dedup check failed (continuing without dedup): %s", db_e)
+        return False
+
     async def run(self, limit=10):
         logger.info("[Researcher] Starting limit=%s", limit)
         conversation_memory.update_agent_state("researcher", {"state": "running"})
         raw = await scraper.scrape_trending_products(limit=limit)
         products = []
         decisions = 0
+
+        port = os.getenv("PORT", "8080")
+        base = f"http://127.0.0.1:{port}"
 
         for p in raw:
             scores = p.get("scores", {})
@@ -71,7 +125,7 @@ class AgentResearcher:
                     src = p.get("source_data", {})
                     reddit = src.get("reddit", {})
                     trends = src.get("google_trends", {})
-                    
+
                     context = {
                         "product_title": p["title"],
                         "price": p["suggested_sell_price"],
@@ -86,18 +140,26 @@ class AgentResearcher:
                         "trend_interest": trends.get("interest_score", 0),
                         "aliexpress_listings": src.get("aliexpress_listings", 0),
                     }
-                    
+
                     sms = (
                         f"Found '{p['title'][:40]}' on {reddit.get('subreddit', 'Reddit')} "
                         f"({reddit.get('upvotes', 0)} upvotes). Sell: ${p['suggested_sell_price']:.2f} | "
                         f"Cost: ${p['cost_price']:.2f}. Score: {total}/130."
                     )
                     timeout = (datetime.now(timezone.utc) + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S")
-                    port = os.getenv("PORT", "8080")
 
                     async with httpx.AsyncClient(timeout=30.0) as client:
+                        # Skip products already posted today (BEFORE creating, so we
+                        # never create+notify a duplicate).
+                        if await self._already_posted_today(client, base, p["title"]):
+                            logger.info("[Researcher] Skipping duplicate '%s' (already posted today)", p["title"])
+                            continue
+
+                        # Create the decision. The decisions endpoint sends the SINGLE
+                        # Telegram approval card. Do NOT call send_approval_request here
+                        # again — that double-send was the duplicate-cards bug.
                         resp = await client.post(
-                            f"http://127.0.0.1:{port}/api/decisions",
+                            f"{base}/api/decisions",
                             json={
                                 "agent_name": "researcher",
                                 "decision_type": "product_approval",
@@ -105,48 +167,15 @@ class AgentResearcher:
                                 "sms_text_sent": sms,
                                 "timeout_at": timeout,
                             },
-                            headers={"Authorization": "Bearer change_this_to_a_random_32_char_string"},
+                            headers={"Authorization": f"Bearer {_INTERNAL_TOKEN}"},
                         )
-                        
+
                         if resp.status_code == 201:
-                            decision_data = resp.json()
-                            decision_id = decision_data.get("id")
-                            logger.info("[Researcher] Decision %s created for '%s'", decision_id, p["title"])
-
-                            # DATABASE DEDUPLICATION: Check if we already sent this exact product today
-                            product_title = context.get("product_title", "")
-                            already_sent = False
-                            try:
-                                check_resp = await client.get(
-                                    f"http://127.0.0.1:{port}/api/decisions",
-                                    headers={"Authorization": "Bearer change_this_to_a_random_32_char_string"}
-                                )
-                                if check_resp.status_code == 200:
-                                    existing = check_resp.json()
-                                    today = datetime.now(timezone.utc).date().isoformat()
-                                    for dec in existing:
-                                        if (dec.get("context_json", {}).get("product_title") == product_title and 
-                                            dec.get("created_at", "")[:10] == today and dec.get("id") != decision_id):
-                                            already_sent = True
-                                            break
-                            except Exception as db_e:
-                                logger.warning(f"[Researcher] DB check failed: {db_e}")
-                            
-                            if not already_sent and decision_id:
-                                try:
-                                    await telegram_service.send_approval_request(
-                                        decision_id=decision_id,
-                                        agent_name="researcher",
-                                        decision_type="product_approval",
-                                        sms_text=sms,
-                                        context=context,
-                                    )
-                                    logger.info("[Researcher] Telegram notification sent for decision %s", decision_id)
-                                except Exception as te:
-                                    logger.error("[Researcher] Telegram send failed: %s", te)
-                            else:
-                                logger.info("[Researcher] Skipped duplicate Telegram send for '%s'", product_title)
-
+                            decision_id = resp.json().get("id")
+                            logger.info(
+                                "[Researcher] Decision %s created for '%s' (card sent by decisions endpoint)",
+                                decision_id, p["title"],
+                            )
                             decisions += 1
                         else:
                             logger.warning("[Researcher] API status: %s body: %s", resp.status_code, resp.text[:200])
