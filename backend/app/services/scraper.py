@@ -1,19 +1,18 @@
-"""Ultimate Production Scraper - Strict Noun-Phrase Extraction + Fallback Pricing + Price Filter.
+"""Ultimate Production Scraper - Real Products, Real Prices, Real Names.
 
-CHANGES vs previous version:
-  TASK 1 (CRITICAL): _extract_product_name() rewritten.
-    - Word-boundary noun matching (old `noun in title_lower` matched substrings, e.g. "yoga" in "yogator")
-    - Scans right-to-left so the HEAD noun wins ("pepper grinder" -> "grinder", not "pepper")
-    - Extracts only the noun phrase: the noun + up to 2 preceding modifier words
-    - Stops collecting modifiers at numbers, filler words, and mid-title proper nouns (brand-ish words)
-    - Rejects titles with fewer than MINIMUM_WORDS (3) words
-    - Rejects generic conversational titles ("Love this sub", "Check out my...", etc.)
-    - Rejects single-word results
-  TASK 2 (HIGH): Fallback pricing when AliExpress returns nothing — product is no longer dropped.
-  TASK 5 (LOW): Price filter — only keep products whose sell price is in the $15–$80 impulse-buy range.
+DESIGN (v3):
+  - Reddit titles are NEVER used as the final product name. They are only a
+    signal of demand. We extract a clean SEARCH KEYWORD from the title.
+  - The final product name is the ACTUAL AliExpress listing's title (cleaned),
+    so name, cost price, and supplier URL always describe the same real item.
+  - A relevance check rejects AliExpress results that don't match the keyword,
+    instead of blindly trusting products_list[0].
+  - NO estimated/fallback pricing. If AliExpress has no relevant, priced
+    listing, the product is dropped. Only real prices enter the pipeline.
+  - Price filter: sell price must land in the $15-$80 impulse-buy window.
 """
 import logging, os, urllib.parse, re
-from typing import List, Dict, Any, Set, Optional, Tuple
+from typing import List, Dict, Any, Set, Optional
 
 import httpx
 
@@ -43,65 +42,49 @@ CONTENT_BLACKLIST = [
     r"\b(list of|a list|things made|not made in|from canada|from usa|submission)\b",
 ]
 
-# --- TASK 1: new rejection layers -------------------------------------------------
-
 MINIMUM_WORDS = 3  # titles shorter than this are conversational noise, not products
 
 # Conversational/meta titles that are never products, even if they contain a product noun.
 GENERIC_TITLE_PATTERNS = [
     r"^(i\s+)?(love|loved|loving|like|liked|enjoy|enjoying|hate)\b",
     r"^(check\s+out|look\s+at|behold|presenting|introducing)\b",
-    r"^(just\s+(got|bought|found|arrived|ordered))\b",
+    r"^(i\s+)?(just\s+(got|bought|found|ordered))\b",
     r"^(finally|update|psa|question|help|advice|thoughts|opinion|opinions)\b",
     r"^(what|which|where|when|why|how|who|does|do|is|are|can|should|anyone|any)\b",
     r"\bthis\s+sub(reddit)?\b",
     r"\b(am\s+i|are\s+we|imo|imho|eli5|til|ama)\b",
 ]
 
-# Words that terminate modifier collection (they never belong in a product name).
+# Words that terminate keyword-modifier collection (never part of a product name).
 FILLER_WORDS = {
     "i", "we", "my", "our", "your", "his", "her", "their", "its",
     "the", "a", "an", "this", "that", "these", "those", "it",
     "is", "was", "are", "were", "be", "been", "has", "have", "had",
     "got", "get", "getting", "bought", "found", "made", "make",
     "just", "still", "finally", "probably", "maybe", "definitely", "really", "very",
+    "amazing", "awesome", "great", "best", "favorite", "favourite", "perfect", "incredible",
     "today", "yesterday", "now", "then", "ever", "never", "always",
     "year", "years", "month", "months", "week", "weeks", "day", "days", "old", "new",
     "after", "before", "since", "about", "around", "over", "under", "with", "without",
     "for", "from", "of", "in", "on", "at", "to", "and", "or", "but", "so",
-    "love", "loves", "loved", "like", "likes", "liked", "best", "favorite", "favourite",
+    "love", "loves", "loved", "like", "likes", "liked",
+    # verbs/comparatives seen polluting keywords in production ("redo cable", "safer battery")
+    "redo", "fix", "fixed", "replace", "replaced", "repair", "repaired",
+    "upgrade", "upgraded", "need", "needs", "needed", "want", "wanted", "use", "used", "using",
+    "safer", "better", "cheaper", "easier", "stronger", "faster", "slower",
+    "bigger", "smaller", "longer", "shorter", "newer", "older", "nicer", "worse",
 }
 
-# Final-result sanity blacklist: if the extracted phrase equals one of these, reject.
-GENERIC_RESULT_PHRASES = {
-    "love this", "check out", "this sub", "new one", "good one", "great one",
-}
-
-# --- TASK 2: fallback pricing (cost, sell) when AliExpress returns nothing --------
-
-FALLBACK_PRICES: Dict[str, Tuple[float, float]] = {
-    "grinder": (6.0, 24.99), "bag": (10.0, 39.99), "backpack": (14.0, 49.99),
-    "wallet": (5.0, 22.99), "organizer": (7.0, 27.99), "holder": (4.0, 18.99),
-    "stand": (6.0, 24.99), "mount": (5.0, 21.99), "charger": (6.0, 25.99),
-    "cable": (2.5, 15.99), "adapter": (3.0, 16.99), "light": (7.0, 28.99),
-    "lamp": (9.0, 34.99), "speaker": (12.0, 44.99), "headphone": (12.0, 44.99),
-    "earbud": (8.0, 32.99), "watch": (12.0, 44.99), "tracker": (9.0, 34.99),
-    "camera": (15.0, 54.99), "lock": (6.0, 24.99), "cleaner": (8.0, 29.99),
-    "purifier": (15.0, 54.99), "massager": (12.0, 44.99), "pillow": (9.0, 34.99),
-    "blanket": (12.0, 44.99), "case": (4.0, 18.99), "knife": (8.0, 29.99),
-    "bottle": (5.0, 21.99), "mug": (4.0, 18.99), "flashlight": (7.0, 27.99),
-    "tool": (8.0, 29.99), "kit": (10.0, 36.99), "gadget": (8.0, 29.99),
-    "mat": (8.0, 29.99), "pad": (6.0, 24.99), "belt": (6.0, 24.99),
-    "gloves": (5.0, 21.99), "boots": (16.0, 59.99), "shoes": (14.0, 49.99),
-    "umbrella": (7.0, 27.99), "fan": (9.0, 34.99), "heater": (14.0, 49.99),
-    "tent": (20.0, 69.99), "scale": (8.0, 29.99), "clock": (7.0, 27.99),
-}
-DEFAULT_FALLBACK: Tuple[float, float] = (8.0, 29.99)
-
-# --- TASK 5: dropshipping price window ---------------------------------------------
+# Marketing junk to strip from AliExpress listing titles.
+ALI_TITLE_JUNK = [
+    r"\b(20\d{2})\b", r"\bnew\b", r"\bhot\s*sale\b", r"\bfree\s*shipping\b",
+    r"\bdropshipping\b", r"\bwholesale\b", r"\bhigh\s*quality\b", r"\b\d+\s*pcs?\b",
+    r"\b\d+\s*pack\b", r"\bfor\s+(men|women|kids|home|gift)s?\b.*$",
+]
 
 MIN_SELL_PRICE = 15.0
 MAX_SELL_PRICE = 80.0
+MAX_NAME_WORDS = 8  # cap on cleaned AliExpress titles
 
 # ONLY concrete physical product nouns - no generic terms
 PRODUCT_NOUNS = {
@@ -123,7 +106,7 @@ PRODUCT_NOUNS = {
 class ScraperService:
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        logger.info("[SCRAPER] Starting Strict Scrape")
+        logger.info("[SCRAPER] Starting Strict Scrape v3.1 (real names + real prices only)")
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
             logger.error("[SCRAPER] RAPIDAPI_KEY not set!")
@@ -132,51 +115,49 @@ class ScraperService:
         posts = await self._get_reddit_posts()
         logger.info(f"[SCRAPER] Got {len(posts)} posts from Reddit")
 
-        products = []
+        # Step 1: extract clean SEARCH KEYWORDS (not final names) from Reddit titles
+        candidates = []
         for post in posts:
-            product_name = self._extract_product_name(post["title"])
-            if product_name:
-                product_key = product_name.lower()
-                if product_key not in _GLOBAL_SEEN:
-                    _GLOBAL_SEEN.add(product_key)
-                    products.append({
-                        "name": product_name,
+            keyword = self._extract_search_keyword(post["title"])
+            if keyword:
+                key = keyword.lower()
+                if key not in _GLOBAL_SEEN:
+                    _GLOBAL_SEEN.add(key)
+                    candidates.append({
+                        "keyword": keyword,
                         "subreddit": post["subreddit"],
                         "upvotes": post["score"]
                     })
 
-        logger.info(f"[SCRAPER] Extracted {len(products)} clean, unique products to test")
+        logger.info(f"[SCRAPER] Extracted {len(candidates)} clean, unique keywords to test")
 
         results = []
-        for p in products[:10]:
-            logger.info(f"[SCRAPER] Testing product: '{p['name']}'")
-            ali_data = await self._get_real_aliexpress_data(p["name"], rapidapi_key)
+        for c in candidates[:10]:
+            logger.info(f"[SCRAPER] Searching AliExpress for: '{c['keyword']}'")
+            ali_data = await self._get_real_aliexpress_data(c["keyword"], rapidapi_key)
 
-            # TASK 2: fallback pricing instead of dropping the product
-            if not (ali_data and ali_data.get("price")):
-                ali_data = self._fallback_pricing(p["name"])
-                logger.info(
-                    f"[SCRAPER] FALLBACK pricing for '{p['name']}': "
-                    f"Cost ${ali_data['price']}, Sell ${ali_data['sell_price']}"
-                )
+            # NO fallback pricing. No relevant priced listing => drop the candidate.
+            if not ali_data:
+                logger.info(f"[SCRAPER] DROP '{c['keyword']}': no relevant AliExpress listing with a real price")
+                continue
 
-            # TASK 5: impulse-buy price window
+            # Price window filter
             if not (MIN_SELL_PRICE <= ali_data["sell_price"] <= MAX_SELL_PRICE):
                 logger.info(
-                    f"[SCRAPER] SKIP '{p['name']}': sell ${ali_data['sell_price']} "
+                    f"[SCRAPER] SKIP '{ali_data['name']}': sell ${ali_data['sell_price']} "
                     f"outside ${MIN_SELL_PRICE}-${MAX_SELL_PRICE} window"
                 )
                 continue
 
-            scores = self._calculate_scores(p["name"], p["upvotes"], ali_data["price"])
+            # The FINAL NAME is the real AliExpress listing's (cleaned) title.
+            scores = self._calculate_scores(ali_data["name"], c["upvotes"], ali_data["price"])
             total_score = sum(scores.values())
             if total_score >= 75:
                 results.append({
-                    "title": p["name"],
+                    "title": ali_data["name"],
                     "description": (
-                        f"Trending on r/{p['subreddit']} ({p['upvotes']} upvotes). "
-                        + ("Real AliExpress product." if not ali_data.get("estimated")
-                           else "Estimated pricing (no AliExpress match).")
+                        f"Demand signal: r/{c['subreddit']} ({c['upvotes']} upvotes, "
+                        f"keyword '{c['keyword']}'). Real AliExpress listing."
                     ),
                     "supplier_url": ali_data["url"],
                     "cost_price": ali_data["price"],
@@ -185,17 +166,17 @@ class ScraperService:
                     "scores": scores,
                     "total_score": total_score,
                     "source_data": {
-                        "reddit": {"subreddit": p["subreddit"], "upvotes": p["upvotes"]},
-                        "google_trends": {"interest_score": min(p["upvotes"] // 10, 100)},
+                        "reddit": {"subreddit": c["subreddit"], "upvotes": c["upvotes"],
+                                   "search_keyword": c["keyword"]},
+                        "google_trends": {"interest_score": min(c["upvotes"] // 10, 100)},
                         "aliexpress_listings": ali_data.get("orders", 0),
-                        "pricing_estimated": bool(ali_data.get("estimated", False)),
                     }
                 })
                 if len(results) >= limit:
                     break
 
         results.sort(key=lambda x: x["total_score"], reverse=True)
-        logger.info(f"[SCRAPER] Final: {len(results)} products in pipeline")
+        logger.info(f"[SCRAPER] Final: {len(results)} products with REAL names and REAL prices")
         return results[:limit]
 
     async def _get_reddit_posts(self) -> List[Dict]:
@@ -227,41 +208,34 @@ class ScraperService:
         return posts
 
     # ------------------------------------------------------------------
-    # TASK 1: strict noun-phrase extraction
+    # Keyword extraction (from Reddit titles) — used ONLY to search AliExpress
     # ------------------------------------------------------------------
-    def _extract_product_name(self, title: str) -> Optional[str]:
-        """Extract ONLY the product noun phrase (noun + up to 2 modifiers).
+    def _extract_search_keyword(self, title: str) -> Optional[str]:
+        """Extract a clean search keyword (product noun + up to 2 modifiers).
 
-        Returns None for conversational titles, generic phrases, brand posts,
-        blacklisted content, and titles under MINIMUM_WORDS words.
+        This is NOT the final product name — it is only the AliExpress search
+        query. The final name comes from the matched AliExpress listing.
         """
         title_lower = title.lower()
 
-        # Layer 1: brand blacklist
         if any(brand in title_lower for brand in BRAND_BLACKLIST):
             return None
-
-        # Layer 2: content blacklist
         for pattern in CONTENT_BLACKLIST:
             if re.search(pattern, title_lower):
                 return None
-
-        # Layer 3: conversational/meta titles ("Love this sub", "Just got...", questions)
         for pattern in GENERIC_TITLE_PATTERNS:
             if re.search(pattern, title_lower):
                 return None
 
-        # Normalize: strip [tags], (parens), punctuation
         clean = re.sub(r"\[.*?\]|\(.*?\)", " ", title)
         clean = re.sub(r"[^\w\s'-]", " ", clean)
         clean = re.sub(r"\s+", " ", clean).strip()
         words = clean.split()
 
-        # Layer 4: minimum word count
         if len(words) < MINIMUM_WORDS:
             return None
 
-        # Layer 5: find the HEAD product noun (rightmost match, word-boundary safe)
+        # Rightmost product noun = head noun ("pepper grinder" -> grinder)
         noun_idx = None
         for i in range(len(words) - 1, -1, -1):
             if words[i].lower().strip("'-") in PRODUCT_NOUNS:
@@ -270,10 +244,9 @@ class ScraperService:
         if noun_idx is None:
             return None
 
-        # Detect Title Case posts ("Smoked Carolina Reaper Pepper Grinder") where
-        # capitalization carries no brand signal. Otherwise, a capitalized word
-        # mid-title is treated as a proper noun / brand and stops collection
-        # ("American Eagle messenger bag ..." -> keep "messenger bag", drop "Eagle").
+        # Title Case posts carry no brand signal in capitalization; in mixed-case
+        # titles, a capitalized mid-title word is treated as a brand and stops
+        # collection ("American Eagle messenger bag" -> "messenger bag").
         alpha_words = [w for w in words if w[0].isalpha()]
         cap_ratio = (
             sum(1 for w in alpha_words if w[0].isupper()) / len(alpha_words)
@@ -281,56 +254,98 @@ class ScraperService:
         )
         is_title_case = cap_ratio >= 0.7
 
-        # Layer 6: collect up to 2 preceding modifiers
         phrase = [words[noun_idx]]
         collected = 0
         for i in range(noun_idx - 1, -1, -1):
             if collected >= 2:
                 break
             w = words[i]
-            wl = w.lower()
-            if wl in FILLER_WORDS:
+            if w.lower() in FILLER_WORDS:
                 break
-            if re.match(r"^\d", w):  # numbers ("25 years probably")
+            if re.match(r"^\d", w):
                 break
             if w[0].isupper() and not is_title_case and i != 0:
-                break  # mid-title proper noun => brand, stop here
+                break
             phrase.insert(0, w)
             collected += 1
 
-        name = " ".join(phrase).strip()
-
-        # Layer 7: final sanity checks
-        if len(phrase) < 2:                      # single-word results are too generic
+        keyword = " ".join(phrase).strip().lower()
+        if len(phrase) < 2 or not (3 <= len(keyword) <= 60):
             return None
-        if name.lower() in GENERIC_RESULT_PHRASES:
-            return None
-        if not (3 <= len(name) <= 60):
-            return None
-        return name
+        return keyword
 
     # ------------------------------------------------------------------
-    # TASK 2: fallback pricing
+    # AliExpress lookup — returns the REAL listing's name, price, and URL
     # ------------------------------------------------------------------
-    def _fallback_pricing(self, product_name: str) -> Dict[str, Any]:
-        """Estimated pricing based on the matched product noun, used when
-        AliExpress returns no valid result. Never drops the product."""
-        name_lower = product_name.lower()
-        cost, sell = DEFAULT_FALLBACK
-        for noun, (c, s) in FALLBACK_PRICES.items():
-            if re.search(rf"\b{re.escape(noun)}\b", name_lower):
-                cost, sell = c, s
-                break
-        return {
-            "price": cost,
-            "sell_price": sell,
-            "orders": 0,
-            "estimated": True,
-            "url": f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(product_name)}",
-        }
+    def _is_relevant(self, keyword: str, ali_title: str) -> bool:
+        """The listing must actually match what we searched for.
 
-    async def _get_real_aliexpress_data(self, product_name: str, rapidapi_key: str) -> Optional[Dict]:
-        """Query AliExpress via RapidAPI for real pricing."""
+        Requires the head noun to appear in the AliExpress title, plus at least
+        half of the keyword tokens overall.
+        """
+        if not ali_title:
+            return False
+        ali_lower = ali_title.lower()
+        tokens = keyword.lower().split()
+        head_noun = tokens[-1]
+        # tolerate simple plural/singular differences
+        if not re.search(rf"\b{re.escape(head_noun.rstrip('s'))}s?\b", ali_lower):
+            return False
+        hits = sum(1 for t in tokens if re.search(rf"\b{re.escape(t.rstrip('s'))}s?\b", ali_lower))
+        return hits >= max(1, (len(tokens) + 1) // 2)
+
+    def _clean_ali_title(self, ali_title: str) -> str:
+        """Strip marketing junk from an AliExpress listing title and cap length."""
+        name = ali_title
+        for pattern in ALI_TITLE_JUNK:
+            name = re.sub(pattern, " ", name, flags=re.I)
+        name = re.sub(r"[^\w\s'/-]", " ", name)
+        name = re.sub(r"\s+", " ", name).strip()
+        words = name.split()
+        if len(words) > MAX_NAME_WORDS:
+            name = " ".join(words[:MAX_NAME_WORDS])
+        return name.strip(" -/")
+
+    @staticmethod
+    def _extract_price(product: Dict) -> float:
+        for key in ["sale_price", "min_price", "original_price", "price",
+                    "target_sale_price", "minAmount", "salePrice"]:
+            val = product.get(key)
+            if val:
+                try:
+                    price = float(str(val).replace(",", "").replace("$", ""))
+                    if price > 0:
+                        return price
+                except (ValueError, TypeError):
+                    pass
+        return 0.0
+
+    @staticmethod
+    def _extract_title(product: Dict) -> str:
+        for key in ["product_title", "title", "subject", "name", "productTitle"]:
+            val = product.get(key)
+            if val and isinstance(val, str):
+                return val
+        return ""
+
+    @staticmethod
+    def _extract_orders(product: Dict) -> int:
+        for key in ["total_sale", "orders", "sales", "tradeCount", "lastest_volume"]:
+            val = product.get(key)
+            if val:
+                try:
+                    return int(str(val).replace(",", ""))
+                except (ValueError, TypeError):
+                    pass
+        return 0
+
+    async def _get_real_aliexpress_data(self, keyword: str, rapidapi_key: str) -> Optional[Dict]:
+        """Search AliExpress and return the first RELEVANT listing with a REAL price.
+
+        Returns the listing's own cleaned title as `name`, so the product name
+        always matches the supplier URL and price. Returns None if nothing
+        relevant/priced is found — the candidate is then dropped (no estimates).
+        """
         try:
             url = "https://aliexpress-true-api.p.rapidapi.com/api/v3/products"
             headers = {
@@ -338,7 +353,7 @@ class ScraperService:
                 "X-RapidAPI-Host": "aliexpress-true-api.p.rapidapi.com"
             }
             params = {
-                "keywords": product_name,
+                "keywords": keyword,
                 "target_currency": "USD",
                 "ship_to_country": "US",
                 "sort": "LAST_VOLUME_DESC",
@@ -366,57 +381,52 @@ class ScraperService:
                     products_list = data
 
                 if not products_list:
-                    logger.warning(f"[SCRAPER] No products found for '{product_name}'")
+                    logger.warning(f"[SCRAPER] No results for '{keyword}'")
                     return None
 
-                top_product = products_list[0]
+                # Walk candidates: need a real price AND a relevant title.
+                for candidate in products_list[:5]:
+                    if not isinstance(candidate, dict):
+                        continue
+                    raw_title = self._extract_title(candidate)
+                    price = self._extract_price(candidate)
+                    if price <= 0:
+                        continue
+                    if not self._is_relevant(keyword, raw_title):
+                        logger.info(f"[SCRAPER] Irrelevant result for '{keyword}': '{raw_title[:60]}'")
+                        continue
 
-                price = 0
-                for key in ["sale_price", "min_price", "original_price", "price",
-                            "target_sale_price", "minAmount", "salePrice"]:
-                    val = top_product.get(key)
-                    if val:
-                        try:
-                            price = float(str(val).replace(",", ""))
-                            if price > 0:
-                                break
-                        except (ValueError, TypeError):
-                            pass
+                    name = self._clean_ali_title(raw_title)
+                    if len(name) < 3:
+                        continue
 
-                if price <= 0:
-                    logger.warning(f"[SCRAPER] No valid price found. Keys: {list(top_product.keys())}")
-                    return None
+                    orders = self._extract_orders(candidate)
+                    product_url = (candidate.get("product_detail_url") or
+                                   candidate.get("product_url") or
+                                   candidate.get("url") or
+                                   f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(keyword)}")
 
-                orders = 0
-                for key in ["total_sale", "orders", "sales", "tradeCount"]:
-                    val = top_product.get(key)
-                    if val:
-                        try:
-                            orders = int(str(val).replace(",", ""))
-                            break
-                        except (ValueError, TypeError):
-                            pass
+                    markup = 3.0 if price < 10 else 2.5
+                    sell_price = round((price * markup) + 2.50, 2)
+                    if sell_price < 19.99:
+                        sell_price = 19.99
 
-                product_url = (top_product.get("product_detail_url") or
-                               top_product.get("product_url") or
-                               top_product.get("url") or
-                               f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(product_name)}")
+                    logger.info(
+                        f"[SCRAPER] MATCH '{keyword}' -> '{name}' | "
+                        f"Cost: ${price}, Sell: ${sell_price}, Orders: {orders}"
+                    )
+                    return {
+                        "name": name,
+                        "price": price,
+                        "sell_price": sell_price,
+                        "orders": orders,
+                        "url": product_url
+                    }
 
-                markup = 3.0 if price < 10 else 2.5
-                sell_price = round((price * markup) + 2.50, 2)
-                if sell_price < 19.99:
-                    sell_price = 19.99
-
-                logger.info(f"[SCRAPER] SUCCESS: '{product_name}' -> Cost: ${price}, Sell: ${sell_price}")
-                return {
-                    "price": price,
-                    "sell_price": sell_price,
-                    "orders": orders,
-                    "estimated": False,
-                    "url": product_url
-                }
+                logger.warning(f"[SCRAPER] No relevant priced listing for '{keyword}'")
+                return None
         except Exception as e:
-            logger.warning(f"[SCRAPER] RapidAPI error for '{product_name}': {e}")
+            logger.warning(f"[SCRAPER] RapidAPI error for '{keyword}': {e}")
             return None
 
     def _calculate_scores(self, product_name: str, upvotes: int, cost: float) -> Dict[str, int]:
