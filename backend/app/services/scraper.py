@@ -68,6 +68,8 @@ FILLER_WORDS = {
     "got", "get", "getting", "bought", "found", "made", "make",
     "just", "still", "finally", "probably", "maybe", "definitely", "really", "very",
     "amazing", "awesome", "great", "best", "favorite", "favourite", "perfect", "incredible",
+    "useful", "handy", "clever", "genius", "neat", "cool", "coolest", "nice", "sleek", "fancy",
+    "ultimate", "essential", "must", "have", "favorite",
     "today", "yesterday", "now", "then", "ever", "never", "always",
     "year", "years", "month", "months", "week", "weeks", "day", "days", "old", "new",
     "after", "before", "since", "about", "around", "over", "under", "with", "without",
@@ -125,7 +127,7 @@ PRODUCT_NOUNS = {
 class ScraperService:
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        logger.info("[SCRAPER] Starting Strict Scrape v3.3 (wider funnel: +nouns, +subreddits, per-run dedup)")
+        logger.info("[SCRAPER] Starting Strict Scrape v3.4 (apostrophe fix, junk-word filter, 10 variants)")
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
             logger.error("[SCRAPER] RAPIDAPI_KEY not set!")
@@ -250,8 +252,12 @@ class ScraperService:
             if re.search(pattern, title_lower):
                 return None
 
-        clean = re.sub(r"\[.*?\]|\(.*?\)", " ", title)
-        clean = re.sub(r"[^\w\s'-]", " ", clean)
+        # Normalize smart quotes to straight, fold possessives/contractions so
+        # "dad's" -> "dads" (not a stray "s" token), then drop remaining punctuation.
+        clean = title.replace("\u2019", "'").replace("\u2018", "'")
+        clean = re.sub(r"\[.*?\]|\(.*?\)", " ", clean)
+        clean = re.sub(r"'s\b", "s", clean, flags=re.I)
+        clean = re.sub(r"[^\w\s-]", " ", clean)
         clean = re.sub(r"\s+", " ", clean).strip()
         words = clean.split()
 
@@ -380,7 +386,7 @@ class ScraperService:
                 "target_currency": "USD",
                 "ship_to_country": "US",
                 "sort": "LAST_VOLUME_DESC",
-                "page_size": "5"
+                "page_size": "10"
             }
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.get(url, headers=headers, params=params)
@@ -412,7 +418,7 @@ class ScraperService:
                 # cheap and premium/bulk listings; the first-by-volume result is
                 # often the expensive one ($60 electric grinder vs a $15 manual).
                 candidates = []
-                for candidate in products_list[:5]:
+                for candidate in products_list[:10]:
                     if not isinstance(candidate, dict):
                         continue
                     raw_title = self._extract_title(candidate)
