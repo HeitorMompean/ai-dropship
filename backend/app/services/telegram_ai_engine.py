@@ -1,9 +1,16 @@
-"""AI-powered conversation engine for Telegram decision assistant.
+"""AI-powered conversation engine for the Telegram decision assistant.
 
-This module connects to Ollama to provide intelligent, context-aware
-conversations for product approvals, negotiations, and business decisions.
+Migrated from Ollama (localhost — unreachable on Railway) to Groq's cloud API
+(OpenAI-compatible, free tier ~14,400 req/day). Set GROQ_API_KEY in the
+environment; optionally GROQ_MODEL to override the default.
+
+IMPORTANT: process_message() now matches how telegram_webhook.py actually calls
+it — process_message(message, chat_id=...) — instead of the old
+(decision_id, user_message, product_context) signature, which raised
+TypeError on every call and made the webhook silently fall back to templates.
 """
 
+import os
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -14,152 +21,128 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-SYSTEM_PROMPT = """You are the AI Dropshipping Assistant — a strategic business advisor to the store owner (Heitor). Your role is to help make smart product decisions by analyzing data, asking clarifying questions, and providing recommendations.
-
-PERSONALITY:
-- Professional but conversational
-- Think like an experienced dropshipping consultant
-- Always consider profit margins, competition, and market trends
-- Ask questions when information is missing
-- Be honest about risks
-
-RULES:
-1. When the user asks a question, answer thoughtfully using the product data
-2. When uncertain, ALWAYS ask a clarifying question first
-3. After 1-2 back-and-forth exchanges, provide a clear recommendation
-4. Track the conversation context to avoid repeating yourself
-5. If user says "just do it" / "go ahead" / "approved" → finalize as approved
-6. If user says "pass" / "skip" / "reject" → finalize as rejected
-7. If user wants to negotiate, suggest concrete strategies
-8. Format responses with clear sections using bullets and bold text
-
-RESPONSE FORMAT:
-Always respond in this JSON format:
-{
-  "action": "respond" | "ask_question" | "approve" | "reject" | "negotiate" | "needs_clarification",
-  "message": "Your natural language response to the user",
-  "question_for_user": "If action is 'ask_question', the specific question to ask",
-  "confidence": 0.0-1.0,
-  "reasoning": "Brief internal reasoning for your decision"
-}"""
+# Light system prompt that works for BOTH free-text chat and the JSON ad-copy
+# prompt the webhook sends. We don't force a rigid JSON schema here, because the
+# ad-gen call supplies its own "respond with ONLY JSON" instruction.
+SYSTEM_PROMPT = (
+    "You are the AI Dropshipping Assistant for the store owner. "
+    "Be concise, practical, and honest about margins, competition, and risk. "
+    "If the user's message explicitly asks for a JSON object, reply with ONLY "
+    "valid JSON and nothing else. Otherwise reply in short, clear plain text "
+    "suitable for a Telegram message."
+)
 
 
 class TelegramAIEngine:
-    """LLM-powered conversation engine for business decisions."""
+    """LLM-powered conversation engine for business decisions (Groq backend)."""
 
     def __init__(self) -> None:
-        self._ollama_url = getattr(settings, "ollama_base_url", "http://host.docker.internal:11434")
-        self._model = getattr(settings, "ollama_model", "dolphin-mistral:7b")
+        # Prefer an explicit env var; fall back to a settings field if present.
+        self._api_key: str = os.getenv("GROQ_API_KEY", getattr(settings, "groq_api_key", "") or "")
+        self._model: str = os.getenv("GROQ_MODEL", getattr(settings, "groq_model", "") or "llama-3.3-70b-versatile")
         self._conversations: Dict[str, List[Dict[str, str]]] = {}
 
-    def _get_history(self, decision_id: str) -> List[Dict[str, str]]:
-        """Get conversation history for a decision."""
-        return self._conversations.get(decision_id, [])
+    # ------------------------------------------------------------------ history
+    def _get_history(self, key: str) -> List[Dict[str, str]]:
+        return self._conversations.get(key, [])
 
-    def _add_to_history(self, decision_id: str, role: str, content: str) -> None:
-        """Add a message to conversation history."""
-        if decision_id not in self._conversations:
-            self._conversations[decision_id] = []
-        self._conversations[decision_id].append({"role": role, "content": content})
-        # Keep last 10 messages to manage context
-        self._conversations[decision_id] = self._conversations[decision_id][-10:]
+    def _add_to_history(self, key: str, role: str, content: str) -> None:
+        self._conversations.setdefault(key, []).append({"role": role, "content": content})
+        # keep last 10 to bound context
+        self._conversations[key] = self._conversations[key][-10:]
 
+    # ------------------------------------------------------------------ main API
     async def process_message(
         self,
-        decision_id: str,
-        user_message: str,
-        product_context: Dict[str, Any],
+        message: str,
+        chat_id: Optional[str] = None,
+        product_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Process user message through LLM and return structured response."""
+        """Process a user/system message through Groq and return a structured dict.
 
-        # Add user message to history
-        self._add_to_history(decision_id, "user", user_message)
+        Returns {"message": <text>, "action": "respond", "confidence": float}.
+        Callers (telegram_webhook) only read ["message"], so this stays compatible
+        whether the model returns prose or JSON.
+        """
+        key = str(chat_id or "default")
+        self._add_to_history(key, "user", message)
 
-        # Build the prompt with context
-        history = self._get_history(decision_id)
-        product_json = json.dumps(product_context, indent=2, default=str)
+        if not self._api_key:
+            return self._fallback_response(
+                "⚠️ AI isn't configured yet. Set GROQ_API_KEY in the environment "
+                "to enable AI replies (free key at console.groq.com)."
+            )
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "system",
-                "content": f"CURRENT PRODUCT CONTEXT:\n{product_json}\n\nCONVERSATION HISTORY:\n{json.dumps(history[-5:], indent=2)}",
-            },
-            {"role": "user", "content": user_message},
-        ]
+        messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if product_context:
+            ctx = json.dumps(product_context, default=str)[:2000]
+            messages.append({"role": "system", "content": f"PRODUCT CONTEXT:\n{ctx}"})
+        # history already ends with the current user message
+        messages.extend(self._get_history(key)[-8:])
 
-        # Call Ollama
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
-                    f"{self._ollama_url}/api/chat",
+                    GROQ_URL,
+                    headers={
+                        "Authorization": f"Bearer {self._api_key}",
+                        "Content-Type": "application/json",
+                    },
                     json={
                         "model": self._model,
                         "messages": messages,
-                        "stream": False,
-                        "format": "json",
-                        "options": {"temperature": 0.7, "num_predict": 500},
+                        "temperature": 0.7,
+                        "max_tokens": 600,
                     },
                 )
                 resp.raise_for_status()
                 data = resp.json()
 
-                # Parse LLM response
-                llm_content = data.get("message", {}).get("content", "{}")
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not content:
+                return self._fallback_response("I didn't get a usable response from the AI. Try again?")
 
-                # Try to parse JSON, fallback to text response
-                try:
-                    result = json.loads(llm_content)
-                except json.JSONDecodeError:
-                    # LLM didn't return valid JSON, wrap it
-                    result = {
-                        "action": "respond",
-                        "message": llm_content[:1000],
-                        "question_for_user": None,
-                        "confidence": 0.5,
-                        "reasoning": "LLM returned non-JSON response",
-                    }
-
-                # Validate required fields
-                result.setdefault("action", "respond")
-                result.setdefault("message", "I'm analyzing this for you...")
-                result.setdefault("question_for_user", None)
-                result.setdefault("confidence", 0.5)
-                result.setdefault("reasoning", "")
-
-                # Add assistant response to history
-                self._add_to_history(decision_id, "assistant", result["message"])
-
-                return result
+            self._add_to_history(key, "assistant", content)
+            return {"message": content, "action": "respond", "confidence": 0.6, "reasoning": ""}
 
         except httpx.HTTPStatusError as e:
-            logger.error("Ollama HTTP error: %s", e)
-            return self._fallback_response("Ollama server error. Is it running? Try: ollama run dolphin-mistral:7b")
-        except httpx.ConnectError:
-            logger.error("Cannot connect to Ollama at %s", self._ollama_url)
+            body = ""
+            try:
+                body = e.response.text[:300]
+            except Exception:
+                pass
+            logger.error("Groq HTTP error: %s %s", e, body)
+            # 401 = bad/missing key, 429 = rate limited, 400 = often a bad model name
             return self._fallback_response(
-                "I can't reach the AI brain (Ollama). Please:\n"
-                "1. Open a new PowerShell\n"
-                "2. Run: ollama run dolphin-mistral:7b\n"
-                "3. Then try again here"
+                f"AI service error ({e.response.status_code}). "
+                "Check GROQ_API_KEY and GROQ_MODEL. Details logged."
             )
+        except httpx.ConnectError:
+            logger.error("Cannot reach Groq API")
+            return self._fallback_response("I can't reach the AI service right now. Please try again shortly.")
         except Exception as e:
             logger.error("AI engine error: %s", e)
             return self._fallback_response(f"AI engine error: {str(e)[:200]}")
 
     def _fallback_response(self, message: str) -> Dict[str, Any]:
-        """Return a safe fallback response when LLM fails."""
         return {
             "action": "respond",
             "message": message,
             "question_for_user": None,
             "confidence": 0.0,
-            "reasoning": "Fallback due to LLM error",
+            "reasoning": "Fallback (AI unavailable)",
         }
 
+    # ----------------------------------------------------- rich initial message
     async def generate_initial_message(self, product_context: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate the rich initial approval message with analysis."""
+        """Format the rich initial approval message (no LLM call — pure formatting)."""
         title = product_context.get("title", "Unknown Product")
         price = float(product_context.get("price", 0))
         cost = float(product_context.get("cost", 0))
@@ -170,16 +153,13 @@ class TelegramAIEngine:
         total_score = product_context.get("total_score", 0)
 
         profit = price - cost
-        daily_10 = profit * 10
-        monthly_10 = daily_10 * 30
+        monthly_10 = profit * 10 * 30
 
-        # Build score bars
         score_lines = ""
         if scores:
             for label, value in scores.items():
                 filled = min(int(value), 10)
-                empty = 10 - filled
-                bar = "█" * filled + "░" * empty
+                bar = "█" * filled + "░" * (10 - filled)
                 score_lines += f"\n  {label}: {bar} {value}/10"
 
         message = (
@@ -197,14 +177,12 @@ class TelegramAIEngine:
             f"  • Approve this product\n"
             f"  • Ask me to negotiate cost\n"
             f"  • Request alternative suppliers\n"
-            f"  • Ask me anything about this product\n"
-            f"  • Tell me your concerns"
+            f"  • Ask me anything about this product"
         )
-
         return {
             "message": message,
             "action": "ask_question",
-            "question_for_user": "What's your call on this product? Or do you want me to dig deeper into anything?",
+            "question_for_user": "What's your call on this product?",
             "confidence": 0.7,
         }
 
