@@ -86,7 +86,7 @@ async def _trigger_storekeeper_and_ad(decision: Decision, db: AsyncSession) -> N
         from app.agents.agent_storekeeper import AgentStorekeeper
         storekeeper = AgentStorekeeper()
         result = await storekeeper.list_product(title=title, description=description, cost_price=cost, sell_price=sell, supplier_url=supplier, request_approval=False)
-        shopify_id = str(result.get("product_id", "unknown")) if isinstance(result, dict) else str(result)
+        shopify_id = str(result.get("shopify_product_id", "unknown")) if isinstance(result, dict) else str(result)
         await _send_message(chat_id, f"✅ <b>Listed on Shopify</b>\n🆔 <code>{shopify_id}</code>")
     except Exception as exc:
         shopify_id = "failed"
