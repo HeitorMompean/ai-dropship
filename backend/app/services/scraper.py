@@ -127,7 +127,7 @@ PRODUCT_NOUNS = {
 class ScraperService:
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        logger.info("[SCRAPER] Starting Strict Scrape v3.4 (apostrophe fix, junk-word filter, 10 variants)")
+        logger.info("[SCRAPER] Starting Strict Scrape v3.5 (min-price = real single-unit cost)")
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
             logger.error("[SCRAPER] RAPIDAPI_KEY not set!")
@@ -336,18 +336,37 @@ class ScraperService:
         return name.strip(" -/")
 
     @staticmethod
-    def _extract_price(product: Dict) -> float:
-        for key in ["sale_price", "min_price", "original_price", "price",
-                    "target_sale_price", "minAmount", "salePrice"]:
+    def _extract_price(product: Dict, debug_name: str = "") -> float:
+        """Return the cheapest positive price across the candidate fields.
+
+        AliExpress listings span a price RANGE across variants (1pc, packs,
+        colours). The API can return both ends (e.g. min_price 1.62 and
+        sale_price/original_price 5.45+). Taking the FIRST present field grabbed
+        whichever happened to be listed first — often the high end — which made
+        the cost look wrong. We now take the MIN positive value, i.e. the
+        single-unit sourcing cost a dropshipper actually pays.
+        """
+        found: Dict[str, float] = {}
+        # Standard listing price fields only — NOT app-exclusive flash prices
+        # (app_sale_price etc.), which you may not actually be able to source at.
+        for key in ["sale_price", "min_price", "min_sale_price", "original_price",
+                    "price", "target_sale_price", "minAmount", "salePrice"]:
             val = product.get(key)
-            if val:
-                try:
-                    price = float(str(val).replace(",", "").replace("$", ""))
-                    if price > 0:
-                        return price
-                except (ValueError, TypeError):
-                    pass
-        return 0.0
+            if val in (None, "", 0, "0"):
+                continue
+            try:
+                price = float(str(val).replace(",", "").replace("$", "").strip())
+                if price > 0:
+                    found[key] = price
+            except (ValueError, TypeError):
+                pass
+        if not found:
+            return 0.0
+        chosen = min(found.values())
+        if debug_name:
+            logger.info("[SCRAPER] PRICE FIELDS for '%s': %s -> using min $%.2f",
+                        debug_name, {k: f"${v:.2f}" for k, v in found.items()}, chosen)
+        return chosen
 
     @staticmethod
     def _extract_title(product: Dict) -> str:
@@ -422,7 +441,7 @@ class ScraperService:
                     if not isinstance(candidate, dict):
                         continue
                     raw_title = self._extract_title(candidate)
-                    price = self._extract_price(candidate)
+                    price = self._extract_price(candidate, debug_name=keyword)
                     if price <= 0:
                         continue
                     if not self._is_relevant(keyword, raw_title):
