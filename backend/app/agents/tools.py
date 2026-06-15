@@ -240,8 +240,19 @@ def create_request_human_decision_tool() -> Dict[str, Any]:
             sms_text=sms_text,
         )
 
-        # Send SMS
-        result = await sms_service.send_to_owner(sms_text)
+        # Notify the owner via Telegram. The SMS gateway is deprecated — the app
+        # config itself notes "Telegram Notifications (replaces SMS gateway)" — and
+        # the old sms_service.send_to_owner() call POSTed to
+        # {SMS_GATEWAY_BASE_URL}/api/v1/messages (default http://localhost:8080),
+        # i.e. the app calling itself on a route that doesn't exist -> 404 every scan.
+        try:
+            from app.services.telegram_service import telegram_service
+            result = await telegram_service.send_message(
+                f"🔔 <b>Action needed — {agent_name} ({decision_type})</b>\n\n{sms_text}"
+            )
+        except Exception as notify_exc:
+            logger.error("Telegram notify failed in request_human_decision: %s", notify_exc)
+            result = {"status": "error", "details": str(notify_exc)}
 
         logger.info(
             "Human decision requested by %s (%s): %s",
