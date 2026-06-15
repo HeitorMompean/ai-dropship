@@ -127,7 +127,7 @@ PRODUCT_NOUNS = {
 class ScraperService:
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        logger.info("[SCRAPER] Starting Strict Scrape v3.5 (min-price = real single-unit cost)")
+        logger.info("[SCRAPER] Starting Strict Scrape v3.6 (cheapest variant from supplier URL)")
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
             logger.error("[SCRAPER] RAPIDAPI_KEY not set!")
@@ -336,6 +336,31 @@ class ScraperService:
         return name.strip(" -/")
 
     @staticmethod
+    def _price_from_url(url: str) -> float:
+        """Extract the cheapest variant price from an AliExpress supplier URL.
+
+        The pdp_npi query param (URL-decoded) looks like:
+            ...!USD!<min_orig>!<min_sale>!!<max_orig>!<max_sale>!@<tokens>...
+        i.e. it carries the FULL price range. We read only the price block
+        between 'USD' and the next '@' (so we don't pick up the product-id or
+        trailing flags), and return the smallest positive number = the cheapest
+        variant's price. Returns 0.0 if the URL has no parseable price block
+        (e.g. the wholesale-search fallback URL).
+        """
+        if not url:
+            return 0.0
+        try:
+            decoded = urllib.parse.unquote(url)
+            m = re.search(r"USD([!0-9.]*?)@", decoded)
+            if not m:
+                return 0.0
+            nums = [float(x) for x in re.findall(r"\d+\.\d+|\d+", m.group(1))]
+            nums = [n for n in nums if n > 0]
+            return min(nums) if nums else 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
     def _extract_price(product: Dict, debug_name: str = "") -> float:
         """Return the cheapest positive price across the candidate fields.
 
@@ -441,15 +466,31 @@ class ScraperService:
                     if not isinstance(candidate, dict):
                         continue
                     raw_title = self._extract_title(candidate)
-                    price = self._extract_price(candidate, debug_name=keyword)
-                    if price <= 0:
-                        continue
                     if not self._is_relevant(keyword, raw_title):
                         logger.info(f"[SCRAPER] Irrelevant result for '{keyword}': '{raw_title[:60]}'")
                         continue
                     name = self._clean_ali_title(raw_title)
                     if len(name) < 3:
                         continue
+
+                    product_url = (candidate.get("product_detail_url") or
+                                   candidate.get("product_url") or
+                                   candidate.get("url") or
+                                   f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(keyword)}")
+
+                    # CHEAPEST VARIANT: the structured API field often reports the
+                    # TOP of a listing's price range. The supplier URL's pdp_npi
+                    # string carries the full range, so we also parse the cheapest
+                    # price from it and take the lower of the two sources.
+                    field_price = self._extract_price(candidate, debug_name=keyword)
+                    url_price = self._price_from_url(product_url)
+                    sources = [p for p in (field_price, url_price) if p > 0]
+                    if not sources:
+                        continue
+                    price = min(sources)
+                    if url_price > 0 and url_price < field_price:
+                        logger.info("[SCRAPER] CHEAPEST VARIANT for '%s': field $%.2f vs url $%.2f -> using $%.2f",
+                                    keyword, field_price, url_price, price)
 
                     markup = 3.0 if price < 10 else 2.5
                     sell_price = round((price * markup) + 2.50, 2)
@@ -461,10 +502,7 @@ class ScraperService:
                         "price": price,
                         "sell_price": sell_price,
                         "orders": self._extract_orders(candidate),
-                        "url": (candidate.get("product_detail_url") or
-                                candidate.get("product_url") or
-                                candidate.get("url") or
-                                f"https://www.aliexpress.com/wholesale?SearchText={urllib.parse.quote(keyword)}"),
+                        "url": product_url,
                     })
 
                 if not candidates:
