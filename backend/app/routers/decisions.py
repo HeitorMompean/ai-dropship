@@ -1,9 +1,11 @@
 """Decision queue (human-in-the-loop) REST API router."""
 
+import os
+import hmac
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +16,23 @@ from app.agents.memory import conversation_memory
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/decisions", tags=["decisions"])
+
+# Shared secret for creating decisions. Set INTERNAL_API_TOKEN in the environment
+# (Railway) to lock this down. The researcher reads the SAME env var, so they stay
+# in sync. Until you set it, both fall back to the same default and still match.
+_INTERNAL_TOKEN = os.getenv("INTERNAL_API_TOKEN", "change_this_to_a_random_32_char_string")
+
+
+async def _require_internal_token(authorization: Optional[str] = Header(default=None)) -> None:
+    """Reject decision-creation calls that don't carry the internal token.
+
+    Without this, anyone who can reach the public Railway URL could POST to
+    /api/decisions and make the bot fire Telegram messages.
+    """
+    expected = f"Bearer {_INTERNAL_TOKEN}"
+    if not authorization or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 
 
 @router.get("", response_model=schemas.DecisionListResponse)
@@ -97,6 +116,7 @@ async def decision_conversation(
 async def create_decision(
     payload: schemas.DecisionCreate,
     db: AsyncSession = Depends(get_db),
+    _: None = Depends(_require_internal_token),
 ) -> Decision:
     """Create a new decision requiring owner approval."""
     decision = Decision(
