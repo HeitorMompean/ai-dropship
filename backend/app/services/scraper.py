@@ -32,6 +32,39 @@ BRAND_BLACKLIST = {
     "pixel", "galaxy", "oneplus", "dell xps", "macbook pro", "predator", "arduboy", "gopro",
 }
 
+# Intellectual-property / right-of-publicity risk patterns. Listings whose TITLE
+# matches any of these are dropped before reaching Telegram: unlicensed character,
+# franchise, league, brand, or real-person merch is the #1 cause of Shopify /
+# Stripe / PayPal account suspensions for dropshippers. This is a high-confidence
+# baseline, NOT exhaustive — celebrity coverage in particular can't be complete,
+# so the supplier-link check before APPROVE still matters.
+IP_BLACKLIST = [
+    # film / TV / animation studios & franchises
+    r"\b(disney|pixar|marvel|avengers|spider[- ]?man|iron man|star wars|mandalorian|"
+    r"harry potter|hogwarts|wizarding|lord of the rings|game of thrones|"
+    r"dc comics|batman|superman|wonder woman|justice league|"
+    r"minions|despicable me|shrek|frozen|elsa|moana|encanto|stitch|mickey|minnie)\b",
+    # anime / manga franchises & characters
+    r"\b(pokemon|pok[eé]mon|pikachu|nintendo|mario|luigi|zelda|kirby|sonic|"
+    r"naruto|sasuke|dragon ball|goku|vegeta|one piece|luffy|demon slayer|"
+    r"jujutsu kaisen|attack on titan|my hero academia|sailor moon|gundam|"
+    r"hello kitty|sanrio|kuromi|cinnamoroll|studio ghibli|totoro)\b",
+    # gaming IP
+    r"\b(minecraft|fortnite|roblox|among us|league of legends|overwatch|"
+    r"call of duty|grand theft auto|gta|pubg|valorant|genshin)\b",
+    # sports leagues / clubs
+    r"\b(nfl|nba|mlb|nhl|fifa|uefa|premier league|la liga|"
+    r"real madrid|barcelona|man united|manchester city|lakers|warriors)\b",
+    # real people / celebrity / public-figure signals
+    r"\b(taylor swift|drake|beyonce|kanye|rihanna|ariana grande|billie eilish|"
+    r"ice spice|nicki minaj|travis scott|bad bunny|messi|ronaldo|lebron|"
+    r"princess diana|royal family|kate middleton|elon musk|trump|biden)\b",
+    r"\b(singer|rapper|celebrity|popstar|footballer)\b.*\b(card|poster|shirt|mug|sticker|keychain|portrait)\b",
+    # generic counterfeit / unlicensed signals
+    r"\b(cosplay|replica|bootleg|fan art|fanart|inspired by|official licensed|"
+    r"licensed merch|knockoff)\b",
+]
+
 CONTENT_BLACKLIST = [
     # discussion-signal patterns (post is talking about, not selling, a product)
     r"\b(review|reviews|vs\.?|versus|comparison|compared)\b",
@@ -127,7 +160,7 @@ PRODUCT_NOUNS = {
 class ScraperService:
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        logger.info("[SCRAPER] Starting Strict Scrape v3.6 (cheapest variant from supplier URL)")
+        logger.info("[SCRAPER] Starting Strict Scrape v3.7 (IP filter + real 13-factor scoring)")
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
             logger.error("[SCRAPER] RAPIDAPI_KEY not set!")
@@ -175,7 +208,10 @@ class ScraperService:
                 continue
 
             # The FINAL NAME is the real AliExpress listing's (cleaned) title.
-            scores = self._calculate_scores(ali_data["name"], c["upvotes"], ali_data["price"])
+            scores = self._calculate_scores(
+                ali_data["name"], c["upvotes"], ali_data["price"],
+                sell_price=ali_data["sell_price"], orders=ali_data.get("orders", 0),
+            )
             total_score = sum(scores.values())
             if total_score >= 75:
                 results.append({
@@ -251,6 +287,9 @@ class ScraperService:
         for pattern in GENERIC_TITLE_PATTERNS:
             if re.search(pattern, title_lower):
                 return None
+        # Don't even search AliExpress for obviously IP/celebrity titles.
+        if self._is_ip_risky(title_lower):
+            return None
 
         # Normalize smart quotes to straight, fold possessives/contractions so
         # "dad's" -> "dads" (not a stray "s" token), then drop remaining punctuation.
@@ -334,6 +373,19 @@ class ScraperService:
         if len(words) > MAX_NAME_WORDS:
             name = " ".join(words[:MAX_NAME_WORDS])
         return name.strip(" -/")
+
+    @staticmethod
+    def _is_ip_risky(text: str) -> Optional[str]:
+        """Return the matched IP/celebrity term if `text` looks like unlicensed
+        IP / real-person merch, else None. Used to reject account-risk listings."""
+        if not text:
+            return None
+        low = text.lower()
+        for pattern in IP_BLACKLIST:
+            m = re.search(pattern, low)
+            if m:
+                return m.group(0)[:40]
+        return None
 
     @staticmethod
     def _price_from_url(url: str) -> float:
@@ -466,6 +518,10 @@ class ScraperService:
                     if not isinstance(candidate, dict):
                         continue
                     raw_title = self._extract_title(candidate)
+                    ip_hit = self._is_ip_risky(raw_title)
+                    if ip_hit:
+                        logger.info(f"[SCRAPER] IP-RISK skip for '{keyword}': '{raw_title[:55]}' (matched '{ip_hit}')")
+                        continue
                     if not self._is_relevant(keyword, raw_title):
                         logger.info(f"[SCRAPER] Irrelevant result for '{keyword}': '{raw_title[:60]}'")
                         continue
@@ -532,29 +588,80 @@ class ScraperService:
             logger.warning(f"[SCRAPER] RapidAPI error for '{keyword}': {e}")
             return None
 
-    def _calculate_scores(self, product_name: str, upvotes: int, cost: float) -> Dict[str, int]:
-        scores = {
-            "Problem/Solution": 7, "Passionate Audience": 7, "Profit Margin": 7,
-            "Perceived Value": 7, "Impulse": 7, "Availability": 8,
-            "Trending": 7, "Shipping": 7, "Legal/Safe": 9,
-            "Repeat Purchase": 6, "Visual Appeal": 7, "Price Point": 7,
-            "Competition": 6
-        }
-        if upvotes > 1000:
-            scores["Trending"] = 10; scores["Passionate Audience"] = 9
-        elif upvotes > 500:
-            scores["Trending"] = 9
-        elif upvotes > 200:
-            scores["Trending"] = 8
-        if 8 <= cost <= 25:
-            scores["Price Point"] = 9; scores["Impulse"] = 9
-        return {k: min(v, 10) for k, v in scores.items()}
+    # Category hints used by scoring (kept small + honest).
+    _CONSUMABLE_HINTS = ("filter", "refill", "cartridge", "blade", "strip", "pad",
+                         "wipe", "bag", "disposable", "replacement", "battery")
+    _LEGAL_RISK_HINTS = ("supplement", "vitamin", "pill", "detox", "slimming", "weight loss",
+                         "serum", "cream", "lotion", "medical", "therapy", "cure", "treatment",
+                         "vape", "e-cig", "nicotine", "taser", "pepper spray", "baby", "infant",
+                         "toddler", "lithium")
+
+    def _calculate_scores(self, product_name: str, upvotes: int, cost: float,
+                          sell_price: float = 0.0, orders: int = 0) -> Dict[str, int]:
+        """13-factor score driven by REAL signals where they exist.
+
+        Real (computed from data): Profit Margin, Price Point, Impulse, Trending,
+        Passionate Audience, Availability, Competition, Repeat Purchase, Legal/Safe,
+        Perceived Value. Honest neutral defaults (can't assess from API data):
+        Problem/Solution, Shipping, Visual Appeal — these need a human/image and are
+        left at 7 rather than faked.
+        """
+        name_l = product_name.lower()
+        margin_pct = ((sell_price - cost) / sell_price * 100) if sell_price > 0 else 0.0
+        s: Dict[str, int] = {}
+
+        # Profit Margin — from real margin %
+        s["Profit Margin"] = (10 if margin_pct >= 85 else 9 if margin_pct >= 75 else
+                              8 if margin_pct >= 65 else 7 if margin_pct >= 55 else
+                              6 if margin_pct >= 45 else 4)
+
+        # Price Point & Impulse — impulse-buy sweet spot is ~$15-30
+        s["Price Point"] = (10 if 15 <= sell_price <= 30 else 8 if sell_price <= 45 else
+                            6 if sell_price <= 60 else 5 if sell_price <= 80 else 3)
+        s["Impulse"] = (10 if sell_price <= 25 else 8 if sell_price <= 40 else
+                        6 if sell_price <= 60 else 4)
+
+        # Trending & Passionate Audience — from Reddit upvotes
+        s["Trending"] = (10 if upvotes >= 2000 else 9 if upvotes >= 1000 else
+                         8 if upvotes >= 500 else 7 if upvotes >= 200 else
+                         6 if upvotes >= 100 else 5)
+        s["Passionate Audience"] = max(5, min(10, 5 + upvotes // 150))
+
+        # Availability & Competition — from real AliExpress order volume.
+        # Few orders = low competition but less proven; huge orders = saturated.
+        if orders <= 0:
+            s["Availability"], s["Competition"] = 6, 6
+        elif orders < 50:
+            s["Availability"], s["Competition"] = 8, 8
+        elif orders < 500:
+            s["Availability"], s["Competition"] = 9, 7
+        elif orders < 5000:
+            s["Availability"], s["Competition"] = 9, 6
+        else:
+            s["Availability"], s["Competition"] = 10, 4
+
+        # Repeat Purchase — consumables get reordered, gadgets don't
+        s["Repeat Purchase"] = 8 if any(h in name_l for h in self._CONSUMABLE_HINTS) else 5
+
+        # Legal/Safe — real category risk (IP merch is already filtered out upstream)
+        s["Legal/Safe"] = 5 if any(h in name_l for h in self._LEGAL_RISK_HINTS) else 9
+
+        # Perceived Value — strong margin AND a reasonable price reads as good value
+        s["Perceived Value"] = 8 if (margin_pct >= 60 and sell_price <= 50) else 6
+
+        # Not assessable from API data — honest neutral defaults, not faked highs
+        s["Problem/Solution"] = 7
+        s["Shipping"] = 7
+        s["Visual Appeal"] = 7
+
+        return {k: max(1, min(10, v)) for k, v in s.items()}
 
     async def analyze_google_trends(self, keyword: str):
         return {"keyword": keyword, "interest_score": 65}
 
     async def check_facebook_ads(self, keyword: str):
         return {"keyword": keyword, "competition": "medium"}
+
 
 
 scraper = ScraperService()
