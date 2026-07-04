@@ -95,12 +95,28 @@ class TelegramService:
                 bar = self._bar(int(value))
                 score_lines += f"\n  {label}: {bar} {value}/10"
 
+        # TikTok Shop eligibility line (only shown when the CJ US check ran)
+        tiktok_line = ""
+        if "tiktok_ready" in context:
+            cj_us = context.get("cj_us_warehouse") or {}
+            if context.get("tiktok_ready"):
+                tiktok_line = (
+                    f"\n✅ <b>TikTok Shop ready</b> — CJ US warehouse: "
+                    f"{cj_us.get('name', 'match')[:40]} "
+                    f"(SKU <code>{cj_us.get('sku', '?')}</code>, "
+                    f"{cj_us.get('us_inventory', '?')} in stock, "
+                    f"CJ price ${cj_us.get('sell_price', '?')})\n"
+                )
+            else:
+                tiktok_line = "\n⚠️ <b>Shopify only</b> — no CJ US-warehouse match found\n"
+
         message = (
             f"<b>⚡ NEW PRODUCT — AI ANALYSIS</b>\n"
             f"<b>━━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
             f"📦 <b>{title}</b>\n"
             f"💰 Sell: <b>${price:.2f}</b> | Cost: <b>${cost:.2f}</b> | Margin: <b>{margin_pct}</b>\n"
-            f"🌍 Supplier: {supplier} | 📂 {category}\n\n"
+            f"🌍 Supplier: {supplier} | 📂 {category}\n"
+            f"{tiktok_line}\n"
             f"<b>💵 PROFIT FORECAST</b>\n"
             f"  Per unit: <b>${profit:.2f}</b>\n"
             f"  10/day × 30 days = <b>${monthly_10:,.2f}/month</b>\n\n"
