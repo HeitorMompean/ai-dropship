@@ -160,7 +160,7 @@ PRODUCT_NOUNS = {
 class ScraperService:
 
     async def scrape_trending_products(self, limit: int = 10) -> List[Dict[str, Any]]:
-        logger.info("[SCRAPER] Starting Strict Scrape v3.7 (IP filter + real 13-factor scoring)")
+        logger.info("[SCRAPER] Starting Strict Scrape v3.8 (+ CJ US-warehouse / TikTok eligibility check)")
         rapidapi_key = os.getenv("RAPIDAPI_KEY")
         if not rapidapi_key:
             logger.error("[SCRAPER] RAPIDAPI_KEY not set!")
@@ -214,6 +214,17 @@ class ScraperService:
             )
             total_score = sum(scores.values())
             if total_score >= 75:
+                # TikTok Shop eligibility: TikTok Shop US effectively requires
+                # US-warehouse fulfillment. If a CJ API key is configured, ask
+                # CJ (one call) whether this product exists with US stock.
+                cj_us = None
+                try:
+                    from app.services.cj_fulfillment import cj_service, cj_research_enabled
+                    if cj_research_enabled():
+                        cj_us = await cj_service.find_us_stock(c["keyword"])
+                except Exception as cj_e:
+                    logger.warning(f"[SCRAPER] CJ US check failed for '{c['keyword']}': {cj_e}")
+
                 results.append({
                     "title": ali_data["name"],
                     "description": (
@@ -226,11 +237,13 @@ class ScraperService:
                     "margin": round(ali_data["sell_price"] - ali_data["price"], 2),
                     "scores": scores,
                     "total_score": total_score,
+                    "tiktok_ready": bool(cj_us),
                     "source_data": {
                         "reddit": {"subreddit": c["subreddit"], "upvotes": c["upvotes"],
                                    "search_keyword": c["keyword"]},
                         "google_trends": {"interest_score": min(c["upvotes"] // 10, 100)},
                         "aliexpress_listings": ali_data.get("orders", 0),
+                        "cj_us_warehouse": cj_us,  # {pid, sku, name, sell_price, us_inventory} | None
                     }
                 })
                 if len(results) >= limit:
@@ -661,7 +674,6 @@ class ScraperService:
 
     async def check_facebook_ads(self, keyword: str):
         return {"keyword": keyword, "competition": "medium"}
-
 
 
 scraper = ScraperService()
