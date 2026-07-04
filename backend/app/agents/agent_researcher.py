@@ -139,6 +139,8 @@ class AgentResearcher:
                         "upvotes": reddit.get("upvotes", 0),
                         "trend_interest": trends.get("interest_score", 0),
                         "aliexpress_listings": src.get("aliexpress_listings", 0),
+                        "tiktok_ready": bool(p.get("tiktok_ready", False)),
+                        "cj_us_warehouse": src.get("cj_us_warehouse"),
                     }
 
                     sms = (
