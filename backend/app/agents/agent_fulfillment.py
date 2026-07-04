@@ -96,9 +96,18 @@ class AgentFulfillment:
                 await tool["func"](json.dumps(context), sms_text)
                 record["action"] = "waiting_approval"
             else:
-                # Auto-fulfill (mock for MVP)
-                logger.info("[AgentFulfillment] Auto-fulfilling order %s ($%s)", order.get("name"), total)
-                record["action"] = "auto_fulfilled"
+                # HONEST STATUS: this agent does NOT fulfill orders. Real
+                # fulfillment happens via the orders/create webhook (Telegram
+                # card -> DSers/manual, or CJ auto-order). The old code marked
+                # orders "auto_fulfilled" while shipping nothing — with a real
+                # store that means angry customers and chargebacks. Removed.
+                already_fulfilled = (order.get("fulfillment_status") or "") == "fulfilled"
+                record["action"] = "fulfilled" if already_fulfilled else "pending_fulfillment"
+                if not already_fulfilled:
+                    logger.info(
+                        "[AgentFulfillment] Order %s ($%s) awaiting fulfillment "
+                        "(handled via webhook -> DSers/CJ)", order.get("name"), total
+                    )
 
             processed.append(record)
 
