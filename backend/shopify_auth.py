@@ -1,45 +1,50 @@
-import os
-import threading
+"""Shopify Admin API token manager — auto-refreshes via client credentials grant."""
+
+import asyncio
+import logging
 import time
 
 import httpx
 
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
 _cache = {"token": None, "expires_at": 0.0}
-_lock = threading.Lock()
+_lock = asyncio.Lock()
 
 
-def get_shopify_token() -> str:
-    """Return a valid Shopify Admin API token, auto-refreshing every ~24h."""
+async def get_shopify_token(force_refresh: bool = False) -> str:
+    """Return a valid Admin API access token, refreshing when expired (every ~24h)."""
     now = time.time()
-    if _cache["token"] and now < _cache["expires_at"] - 300:
+    if not force_refresh and _cache["token"] and now < _cache["expires_at"] - 300:
         return _cache["token"]
 
-    with _lock:
+    async with _lock:
         now = time.time()
-        if _cache["token"] and now < _cache["expires_at"] - 300:
+        if not force_refresh and _cache["token"] and now < _cache["expires_at"] - 300:
             return _cache["token"]
 
-        store = os.environ["SHOPIFY_STORE"]
-        resp = httpx.post(
-            f"https://{store}.myshopify.com/admin/oauth/access_token",
-            json={
-                "client_id": os.environ["SHOPIFY_CLIENT_ID"],
-                "client_secret": os.environ["SHOPIFY_CLIENT_SECRET"],
-                "grant_type": "client_credentials",
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        logger.info("Refreshing Shopify access token (client credentials grant)")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"https://{settings.shopify_shop_name}/admin/oauth/access_token",
+                json={
+                    "client_id": settings.shopify_client_id,
+                    "client_secret": settings.shopify_client_secret,
+                    "grant_type": "client_credentials",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
         _cache["token"] = data["access_token"]
         _cache["expires_at"] = now + int(data.get("expires_in", 86399))
+        logger.info("Shopify token refreshed successfully")
         return _cache["token"]
 
 
-def shopify_headers() -> dict:
-    """Drop-in replacement for your old headers dict."""
-    return {
-        "X-Shopify-Access-Token": get_shopify_token(),
-        "Content-Type": "application/json",
-    }
+def invalidate_token() -> None:
+    """Force next call to fetch a fresh token (used after a 401)."""
+    _cache["token"] = None
+    _cache["expires_at"] = 0.0
