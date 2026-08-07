@@ -1,10 +1,11 @@
-"""Shopify API client wrapper with demo-mode fallback."""
+"""Shopify API client wrapper with demo-mode fallback and auto-refreshing token."""
 
 import json
 import logging
 from typing import Any, Dict, List, Optional
 import httpx
 from app.config import settings
+from app.services.shopify_auth import get_shopify_token, invalidate_token
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,6 @@ class ShopifyClient:
 
     def __init__(self) -> None:
         self.shop_name = settings.shopify_shop_name
-        self.access_token = settings.shopify_access_token
         self.api_version = "2026-04"
         self.base_url = f"https://{self.shop_name}/admin/api/{self.api_version}"
         self.demo_mode = settings.is_demo_mode
@@ -22,18 +22,18 @@ class ShopifyClient:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            headers = {}
-            if not self.demo_mode:
-                headers["X-Shopify-Access-Token"] = self.access_token
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers=headers,
                 timeout=httpx.Timeout(30.0),
             )
         return self._client
 
+    async def _auth_headers(self) -> Dict[str, str]:
+        """Get headers with a fresh (cached) access token."""
+        return {"X-Shopify-Access-Token": await get_shopify_token()}
+
     async def _request(
-        self, method: str, path: str, json_data: Optional[Dict[str, Any]] = None
+        self, method: str, path: str, json_data: Optional[Dict[str, Any]] = None, _retry: bool = True
     ) -> Dict[str, Any]:
         """Make an HTTP request to Shopify Admin API or return mock data in demo mode."""
         if self.demo_mode:
@@ -41,10 +41,15 @@ class ShopifyClient:
 
         client = await self._get_client()
         try:
-            response = await client.request(method, path, json=json_data)
+            headers = await self._auth_headers()
+            response = await client.request(method, path, json=json_data, headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401 and _retry:
+                logger.warning("Shopify 401 — invalidating token and retrying once")
+                invalidate_token()
+                return await self._request(method, path, json_data, _retry=False)
             logger.error("Shopify HTTP error: %s %s -> %s", method, path, exc.response.text)
             raise
         except httpx.RequestError as exc:
@@ -120,7 +125,8 @@ class ShopifyClient:
             return True
         try:
             client = await self._get_client()
-            response = await client.delete(f"/products/{product_id}.json")
+            headers = await self._auth_headers()
+            response = await client.delete(f"/products/{product_id}.json", headers=headers)
             return response.status_code == 200
         except Exception as exc:
             logger.error("Delete product error: %s", exc)
