@@ -1,4 +1,4 @@
-﻿"""Application configuration via Pydantic Settings."""
+"""Application configuration via Pydantic Settings."""
 
 from pydantic_settings import BaseSettings
 from pydantic import Field
@@ -12,7 +12,9 @@ class Settings(BaseSettings):
     shopify_shop_name: str = Field(default="demo-store.myshopify.com", alias="SHOPIFY_SHOP_NAME")
     shopify_api_key: str = Field(default="demo_key", alias="SHOPIFY_API_KEY")
     shopify_api_secret: str = Field(default="demo_secret", alias="SHOPIFY_API_SECRET")
-    shopify_access_token: str = Field(default="demo_token", alias="SHOPIFY_ACCESS_TOKEN")
+    shopify_access_token: str = Field(default="", alias="SHOPIFY_ACCESS_TOKEN")
+    shopify_client_id: str = Field(default="", alias="SHOPIFY_CLIENT_ID")
+    shopify_client_secret: str = Field(default="", alias="SHOPIFY_CLIENT_SECRET")
     shopify_webhook_secret: str = Field(default="demo_webhook_secret", alias="SHOPIFY_WEBHOOK_SECRET")
 
     # Facebook Ads
@@ -49,11 +51,10 @@ class Settings(BaseSettings):
 
     @property
     def is_demo_mode(self) -> bool:
-        """Return True if running in demo mode (default credentials)."""
-        return (
-            self.shopify_access_token in ("demo_token", "your_admin_api_token")
-            or self.shopify_api_key == "your_api_key"
-        )
+        """Return True if running in demo mode (no real Shopify credentials)."""
+        has_oauth_creds = bool(self.shopify_client_id and self.shopify_client_secret)
+        has_static_token = self.shopify_access_token not in ("", "demo_token", "your_admin_api_token")
+        return not (has_oauth_creds or has_static_token)
 
     class Config:
         env_file = ".env"
@@ -62,4 +63,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
